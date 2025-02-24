@@ -1,3 +1,2 @@
-(lang dune 2.7)
-(name utcp)
+(lang dune 2.8)
 (formatting disabled)
