@@ -12,6 +12,8 @@ type 'a packet =
   ; protocol : protocol
   ; payload : 'a }
 
+type handler = Bstr.t packet -> unit
+
 val write :
      t
   -> ?force:bool
@@ -43,6 +45,9 @@ val create :
   -> ?handler:(Bstr.t packet -> unit)
   -> Macaddr.t
   -> Miou_solo5.Net.t
-  -> daemon * t
+  -> (daemon * t, [> `MTU_too_small ]) result
 
 val kill : daemon -> unit
+val mtu : t -> int
+val macaddr : t -> Macaddr.t
+val set_handler : t -> handler -> unit

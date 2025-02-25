@@ -8,6 +8,11 @@ module Packet = struct
     | IPv4
     | IPv6
 
+  let pp_protocol ppf = function
+    | ARPv4 -> Fmt.string ppf "ARPv4"
+    | IPv4 -> Fmt.string ppf "IPv4"
+    | IPv6 -> Fmt.string ppf "IPv6"
+
   type t =
     { src : Macaddr.t
     ; dst : Macaddr.t
@@ -63,7 +68,7 @@ type protocol = Packet.protocol =
 
 type t =
   { net : Miou_solo5.Net.t
-  ; handler : handler
+  ; mutable handler : handler
   ; frames : string packet Queue.t
   ; mtu : int
   ; mac : Macaddr.t
@@ -94,28 +99,36 @@ let read_or_write t =
 let write t packet =
   let src = Option.value ~default:t.mac packet.src in
   let pkt = { Packet.src; dst= packet.dst; protocol= Some packet.protocol } in
-  Packet.encode_into ~off:0 pkt t.bstr_oc;
-  let len = String.length packet.payload in
-  Bstr.blit_from_string packet.payload ~src_off:0 t.bstr_oc ~dst_off:16 ~len;
-  Miou_solo5.Net.write_bigstring t.net t.bstr_oc
+  try
+    Packet.encode_into ~off:0 pkt t.bstr_oc;
+    let len = String.length packet.payload in
+    Bstr.blit_from_string packet.payload ~src_off:0 t.bstr_oc ~dst_off:16 ~len;
+    Log.debug (fun m -> m "write ethernet packet src:%a -> dst:%a"
+      Macaddr.pp src Macaddr.pp packet.dst);
+    Miou_solo5.Net.write_bigstring t.net t.bstr_oc
+  with exn -> Log.err (fun m -> m "Unexpected exception: %s" (Printexc.to_string exn))
 
 let rec daemon t =
+  Log.debug (fun m -> m "ethernet daemon tick");
   Queue.iter (write t) t.frames;
-  Queue.drop t.frames;
+  Queue.clear t.frames;
   match read_or_write t with
-  | Out -> daemon t
+  | Out -> Miou.yield (); daemon t
   | In payload ->
      let ok ({ Packet.protocol; src; dst }, payload) =
        match protocol with
-       | None ->
-         let payload = Bstr.to_string payload in
-         Log.debug (fun m -> m "Ignore packet (src:%a -> dst:%a)" Macaddr.pp src Macaddr.pp dst);
-         Log.debug (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) payload)
+       | None -> ()
        | Some protocol ->
          let packet = { src= Some src; dst; protocol; payload } in
          if Macaddr.compare dst t.mac == 0
          || Macaddr.is_unicast dst == false
-         then t.handler packet in
+         then t.handler packet
+         else begin
+           let payload = Bstr.to_string payload in
+           Log.debug (fun m -> m "Ignore packet (src:%a -> dst:%a)" Macaddr.pp src Macaddr.pp dst);
+           Log.debug (fun m -> m "Protocol: %a" Packet.pp_protocol protocol);
+           Log.debug (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) payload)
+         end in
      let error _ =
        let str = Bstr.to_string payload in
        Log.err (fun m -> m "Invalid Ethernet packet");
@@ -143,6 +156,8 @@ let write t ?force ?src ~dst ~protocol payload =
 type daemon = unit Miou.t
 
 let create ?(mtu= 1500) ?(handler= ignore) mac net =
+  let ( let* ) = Result.bind in
+  let* () = guard `MTU_too_small @@ fun () -> mtu > 16 in (* enough for Ethernet packets *)
   let bstr_ic = Bstr.create (16 + mtu) in
   let bstr_oc = Bstr.create (16 + mtu) in
   (* NOTE(dinosaure): the first [Bstr.sub] does a [malloc()], then any
@@ -160,6 +175,17 @@ let create ?(mtu= 1500) ?(handler= ignore) mac net =
     ; bstr_ic
     ; bstr_oc } in
   let daemon = Miou.async @@ fun () -> daemon t in
-  daemon, t
+  Ok (daemon, t)
+
+let _cnt = Atomic.make 0
+
+let mtu { mtu; _ } = mtu
+let macaddr { mac; _ } = mac
+
+let set_handler t handler =
+  Atomic.incr _cnt;
+  t.handler <- handler;
+  if Atomic.get _cnt > 1
+  then Log.warn (fun m -> m "Ethernet handler modified more than once")
 
 let kill = Miou.cancel
