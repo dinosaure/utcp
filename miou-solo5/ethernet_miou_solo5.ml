@@ -102,10 +102,12 @@ let write t packet =
   try
     Packet.encode_into ~off:0 pkt t.bstr_oc;
     let len = String.length packet.payload in
-    Bstr.blit_from_string packet.payload ~src_off:0 t.bstr_oc ~dst_off:16 ~len;
+    Bstr.blit_from_string packet.payload ~src_off:0 t.bstr_oc ~dst_off:14 ~len;
     Log.debug (fun m -> m "write ethernet packet src:%a -> dst:%a"
       Macaddr.pp src Macaddr.pp packet.dst);
-    Miou_solo5.Net.write_bigstring t.net t.bstr_oc
+    Log.debug (fun m -> m "@[<hov>%a@]"
+      (Hxd_string.pp Hxd.default) (Bstr.sub_string t.bstr_oc ~off:0 ~len:(14 + len)));
+    Miou_solo5.Net.write_bigstring t.net ~off:0 ~len:(14 + len) t.bstr_oc
   with exn -> Log.err (fun m -> m "Unexpected exception: %s" (Printexc.to_string exn))
 
 let rec daemon t =
@@ -157,13 +159,13 @@ type daemon = unit Miou.t
 
 let create ?(mtu= 1500) ?(handler= ignore) mac net =
   let ( let* ) = Result.bind in
-  let* () = guard `MTU_too_small @@ fun () -> mtu > 16 in (* enough for Ethernet packets *)
-  let bstr_ic = Bstr.create (16 + mtu) in
-  let bstr_oc = Bstr.create (16 + mtu) in
+  let* () = guard `MTU_too_small @@ fun () -> mtu > 14 in (* enough for Ethernet packets *)
+  let bstr_ic = Bstr.create (14 + mtu) in
+  let bstr_oc = Bstr.create (14 + mtu) in
   (* NOTE(dinosaure): the first [Bstr.sub] does a [malloc()], then any
      [Bstr.sub] are cheap. We should use [Slice] instead of [Bstr]. TODO! *)
-  let bstr_ic = Bstr.sub bstr_ic ~off:0 ~len:(16 + mtu) in
-  let bstr_oc = Bstr.sub bstr_oc ~off:0 ~len:(16 + mtu) in
+  let bstr_ic = Bstr.sub bstr_ic ~off:0 ~len:(14 + mtu) in
+  let bstr_oc = Bstr.sub bstr_oc ~off:0 ~len:(14 + mtu) in
   let t =
     { net
     ; handler

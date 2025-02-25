@@ -14,17 +14,17 @@ module Packet = struct
 
   open Bin
 
-  let ipaddr = map (bytes 4) Ipaddr.V4.of_octets_exn Ipaddr.V4.to_octets
+  let ipaddr = map beint32 Ipaddr.V4.of_int32 Ipaddr.V4.to_int32
   let macaddr = map (bytes 6) Macaddr.of_octets_exn Macaddr.to_octets
   let operation =
     let f = function
-      | 0 -> Request
-      | 1 -> Reply
+      | 1 -> Request
+      | 2 -> Reply
       | n -> Fmt.failwith "Invalid ARP operation (%02x)" n in
     let g = function
-      | Request -> 0
-      | Reply -> 1 in
-    map uint8 f g
+      | Request -> 1
+      | Reply -> 2 in
+    map beuint16 f g
 
   let t =
     let fn _hwtype _ptype _hw_addr_len _p_addr_len
@@ -107,7 +107,7 @@ let create ?(timeout= 800) ?(retries= 5) ?src ?ipaddr eth =
   let cache = Ipaddr.V4.Map.empty in
   let t = { cache; macaddr; ipaddr; timeout; retries; epoch= 0; src; eth } in
   let t, out =
-    if unknown
+    if unknown == false
     then let t, pkt, _ = alias t ipaddr in
          t, Some pkt
     else t, None in
@@ -162,7 +162,7 @@ let tick t =
 let handle_request t arp =
   let dst = arp.Packet.dst_ip in
   let src = arp.Packet.src_ip in
-  Logs.debug ~src:t.src (fun m -> m "%a: who is %a?"
+  Logs.debug ~src:t.src (fun m -> m "%a: who has %a?"
     Ipaddr.V4.pp src Ipaddr.V4.pp dst);
   match Ipaddr.V4.Map.find dst t.cache with
   | exception Not_found -> t, None
@@ -175,7 +175,7 @@ let handle_reply t src macaddr =
     let entry = Dynamic (macaddr, t.epoch + t.timeout) in
     let cache = Ipaddr.V4.Map.add src entry t.cache in
     { t with cache } in
-  Logs.debug ~src:t.src (fun m -> m "handle ARPv4 packet from %a:%a"
+  Logs.debug ~src:t.src (fun m -> m "handle ARPv4 reply packet from %a:%a"
     Macaddr.pp macaddr Ipaddr.V4.pp src);
   match Ipaddr.V4.Map.find src t.cache with
   | exception Not_found -> t, None
