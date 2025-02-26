@@ -28,7 +28,7 @@ module Packet = struct
 
   let t =
     let fn _hwtype _ptype _hw_addr_len _p_addr_len
-      operation src_mac dst_mac src_ip dst_ip =
+      operation src_mac src_ip dst_mac dst_ip =
         { operation; src_mac; dst_mac; src_ip; dst_ip } in
     record fn
     |+ field beuint16 (Fun.const 1)
@@ -37,8 +37,8 @@ module Packet = struct
     |+ field uint8 (Fun.const 4)
     |+ field operation (fun t -> t.operation)
     |+ field macaddr (fun t -> t.src_mac)
-    |+ field macaddr (fun t -> t.dst_mac)
     |+ field ipaddr (fun t -> t.src_ip)
+    |+ field macaddr (fun t -> t.dst_mac)
     |+ field ipaddr (fun t -> t.dst_ip)
     |> sealr
 
@@ -51,36 +51,38 @@ end
 
 let mac0 = Macaddr.of_octets_exn (String.make 6 '\000')
 
-type 'a entry =
+type w = Macaddr.t Miou.Computation.t
+
+type entry =
   | Static of Macaddr.t * bool
   | Dynamic of Macaddr.t * int
-  | Pending of 'a * int
+  | Pending of w * int
 
-type 'a t =
-  { cache : 'a entry Ipaddr.V4.Map.t
+type t =
+  { cache : (Ipaddr.V4.t, entry) Hashtbl.t
   ; macaddr : Macaddr.t
   ; ipaddr : Ipaddr.V4.t
   ; timeout : int
   ; retries : int
-  ; epoch : int
+  ; mutable epoch : int
   ; src : Logs.src
   ; eth : Ethernet.t }
 
 let pending t ipaddr =
-  match Ipaddr.V4.Map.find ipaddr t.cache with
+  match Hashtbl.find t.cache ipaddr with
   | exception Not_found -> None
-  | Pending (a, _) -> Some a
+  | Pending (w, _) -> Some w
   | _ -> None
 
 let alias t ipaddr =
-  let cache = Ipaddr.V4.Map.add ipaddr (Static (t.macaddr, true)) t.cache in
+  Hashtbl.add t.cache ipaddr (Static (t.macaddr, true));
   let pkt =
     { Packet.operation= Packet.Request
     ; src_mac= t.macaddr
     ; dst_mac= mac0
     ; src_ip= ipaddr
     ; dst_ip= ipaddr } in
-  { t with cache }, (pkt, Macaddr.broadcast), pending t ipaddr
+  (pkt, Macaddr.broadcast), pending t ipaddr
 
 let write t (arp, dst) =
   let pkt = Packet.to_string arp in
@@ -104,25 +106,22 @@ let create ?(timeout= 800) ?(retries= 5) ?src ?ipaddr eth =
   then Fmt.invalid_arg "Arg_miou_solo5.create: negative retries value";
   let unknown = Option.is_none ipaddr in
   let ipaddr = Option.value ~default:Ipaddr.V4.any ipaddr in
-  let cache = Ipaddr.V4.Map.empty in
+  let cache = Hashtbl.create 0x10 in
   let t = { cache; macaddr; ipaddr; timeout; retries; epoch= 0; src; eth } in
-  let t, out =
-    if unknown == false
-    then let t, pkt, _ = alias t ipaddr in
-         t, Some pkt
-    else t, None in
-  Option.iter (write t) out; Ok t
+  begin if unknown == false
+        then let pkt, _ = alias t ipaddr in write t pkt end;
+  Ok t
 
 let _ips t =
   let fn ip entry acc = match entry with
     | Static (_, true) -> ip :: acc
     | _ -> acc in
-  Ipaddr.V4.Map.fold fn t.cache []
+  Hashtbl.fold fn t.cache []
 
 let macaddr t = t.macaddr
 
 let _pending t ip =
-  match Ipaddr.V4.Map.find ip t.cache with
+  match Hashtbl.find t.cache ip with
   | exception Not_found -> None
   | Pending (a, _) -> Some a
   | _ -> None
@@ -144,56 +143,67 @@ let reply arp macaddr =
     ; dst_ip= arp.Packet.src_ip } in
   pkt, arp.Packet.src_mac
 
+exception Timeout
+
+let empty_bt = Printexc.get_callstack 0
+let timeout = (Timeout, empty_bt)
+let wake c = ignore (Miou.Computation.try_cancel c timeout)
+
 let tick t =
   let epoch = t.epoch in
-  let entry k v (cache, acc, r) = match v with
+  let fn k v (pkts, to_remove, timeouts) = match v with
     | Dynamic (_, tick) when tick == epoch ->
-        Ipaddr.V4.Map.remove k cache, acc, r
+        pkts, (k :: to_remove), timeouts
     | Dynamic (_, tick) when tick == epoch + 1 ->
-        cache, request t k :: acc, r
-    | Pending (a, retry) when retry == epoch ->
-        Ipaddr.V4.Map.remove k cache, acc, a :: r
-    | Pending _ -> cache, request t k :: acc, r
-    | _ -> cache, acc, r in
-  let cache, outs, r = Ipaddr.V4.Map.fold entry t.cache  (t.cache, [], []) in
+        request t k :: pkts, to_remove, timeouts
+    | Pending (w, retry) when retry == epoch ->
+        pkts, k :: to_remove, w :: timeouts
+    | Pending _ -> 
+        request t k :: pkts, to_remove, timeouts
+    | _ -> pkts, to_remove, timeouts in
+  let outs, to_remove, timeouts = Hashtbl.fold fn t.cache ([], [], []) in
+  List.iter (Hashtbl.remove t.cache) to_remove;
   List.iter (write t) outs;
-  { t with cache; epoch= t.epoch + 1 }, r
+  List.iter wake timeouts;
+  t.epoch <- t.epoch + 1
 
 let handle_request t arp =
   let dst = arp.Packet.dst_ip in
   let src = arp.Packet.src_ip in
-  Logs.debug ~src:t.src (fun m -> m "%a: who has %a?"
-    Ipaddr.V4.pp src Ipaddr.V4.pp dst);
-  match Ipaddr.V4.Map.find dst t.cache with
-  | exception Not_found -> t, None
+  let src_mac = arp.Packet.src_mac in
+  Logs.debug ~src:t.src (fun m -> m "%a:%a: who has %a?"
+    Macaddr.pp src_mac Ipaddr.V4.pp src Ipaddr.V4.pp dst);
+  match Hashtbl.find t.cache dst with
+  | exception Not_found -> ()
   | Static (macaddr, true) ->
-      write t (reply arp macaddr); t, None
-  | _ -> t, None
+      write t (reply arp macaddr)
+  | _ -> ()
 
 let handle_reply t src macaddr =
-  let t' =
-    let entry = Dynamic (macaddr, t.epoch + t.timeout) in
-    let cache = Ipaddr.V4.Map.add src entry t.cache in
-    { t with cache } in
+  let entry = Dynamic (macaddr, t.epoch + t.timeout) in
   Logs.debug ~src:t.src (fun m -> m "handle ARPv4 reply packet from %a:%a"
     Macaddr.pp macaddr Ipaddr.V4.pp src);
-  match Ipaddr.V4.Map.find src t.cache with
-  | exception Not_found -> t, None
-  | Static _ -> t, None
+  match Hashtbl.find t.cache src with
+  | exception Not_found -> ()
+  | Static (_, adv) ->
+      if adv && Macaddr.compare macaddr mac0 == 0
+      then Logs.debug ~src:t.src (fun m -> m "ignoring gratuitious ARP from %a using %a"
+        Macaddr.pp macaddr Ipaddr.V4.pp src)
   | Dynamic (macaddr', _) ->
       if Macaddr.compare macaddr macaddr' != 0
       then Logs.debug ~src:t.src (fun m -> m "set %a from %a to %a"
         Ipaddr.V4.pp src Macaddr.pp macaddr' Macaddr.pp macaddr);
-      t', None
-  | Pending (v, _) -> t', Some (macaddr, v)
+      Hashtbl.replace t.cache src entry
+  | Pending (c, _) ->
+      ignore (Miou.Computation.try_return c macaddr);
+      Hashtbl.replace t.cache src entry
 
 let input t pkt =
   match Packet.decode pkt.Ethernet.payload with
   | Error _ ->
       let str = Bstr.to_string pkt.payload in
       Logs.err ~src:t.src (fun m -> m "Invalid ARPv4 packet:");
-      Logs.err ~src:t.src (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) str);
-      t, None
+      Logs.err ~src:t.src (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) str)
   | Ok arp ->
       if Ipaddr.V4.compare arp.Packet.src_ip arp.Packet.dst_ip == 0
       || arp.Packet.operation == Packet.Reply
@@ -202,3 +212,22 @@ let input t pkt =
         and src = arp.Packet.src_ip in
         handle_reply t src mac
       else handle_request t arp
+
+let to_error (exn, _bt) = match exn with
+  | Timeout -> `Timeout
+  | exn -> `Exn exn
+
+let query t ipaddr =
+  match Hashtbl.find t.cache ipaddr with
+  | exception Not_found ->
+      let w = Miou.Computation.create () in
+      let pending = Pending (w, t.epoch + t.retries) in
+      Hashtbl.replace t.cache ipaddr pending;
+      write t (request t ipaddr);
+      Miou.Computation.await w
+      |> Result.map_error to_error
+  | Pending (w, _) ->
+      Miou.Computation.await w
+      |> Result.map_error to_error
+  | Static (macaddr, _)
+  | Dynamic (macaddr, _) -> Ok macaddr

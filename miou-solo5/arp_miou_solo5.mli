@@ -4,7 +4,7 @@ module Packet : sig
   type t
 end
 
-type 'a t
+type t
 
 val create :
      ?timeout:int
@@ -12,13 +12,14 @@ val create :
   -> ?src:Logs.Src.t
   -> ?ipaddr:Ipaddr.V4.t
   -> Ethernet.t
-  -> ('a t, [> `MTU_too_small ]) result
+  -> (t, [> `MTU_too_small ]) result
 
-val macaddr : 'a t -> Macaddr.t
+val macaddr : t -> Macaddr.t
 
 val input :
-     'a t
+     t
   -> Bstr.t Ethernet.packet
-  -> 'a t * (Macaddr.t * 'a) option
+  -> unit
 
-val tick : 'a t -> 'a t * 'a list
+val tick : t -> unit
+val query : t -> Ipaddr.V4.t -> (Macaddr.t, [> `Exn of exn | `Timeout ]) result
