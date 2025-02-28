@@ -31,6 +31,15 @@ val write :
     is added and will be written at the next {i opportunity} (if someone else
     forces the writing or if we receive a new ethernet packet). *)
 
+val writev :
+     t
+  -> ?force:bool
+  -> ?src:Macaddr.t
+  -> dst:Macaddr.t
+  -> protocol:protocol
+  -> string list
+  -> (unit, [> `Exceeds_MTU ]) result
+
 val unsafe_write :
      t
   -> ?force:bool
@@ -38,6 +47,15 @@ val unsafe_write :
   -> dst:Macaddr.t
   -> protocol:protocol
   -> string
+  -> unit
+
+val unsafe_writev :
+     t
+  -> ?force:bool
+  -> ?src:Macaddr.t
+  -> dst:Macaddr.t
+  -> protocol:protocol
+  -> string list
   -> unit
 
 val create :

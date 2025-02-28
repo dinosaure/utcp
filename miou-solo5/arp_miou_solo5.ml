@@ -68,21 +68,19 @@ type t =
   ; src : Logs.src
   ; eth : Ethernet.t }
 
-let pending t ipaddr =
-  match Hashtbl.find t.cache ipaddr with
-  | exception Not_found -> None
-  | Pending (w, _) -> Some w
-  | _ -> None
-
 let alias t ipaddr =
-  Hashtbl.add t.cache ipaddr (Static (t.macaddr, true));
+  let () = match Hashtbl.find t.cache ipaddr with
+    | exception Not_found -> ()
+    | Pending (c, _) -> ignore (Miou.Computation.try_return c t.macaddr)
+    | _ -> () in
+  Hashtbl.replace t.cache ipaddr (Static (t.macaddr, true));
   let pkt =
     { Packet.operation= Packet.Request
     ; src_mac= t.macaddr
     ; dst_mac= mac0
     ; src_ip= ipaddr
     ; dst_ip= ipaddr } in
-  (pkt, Macaddr.broadcast), pending t ipaddr
+  (pkt, Macaddr.broadcast)
 
 let write t (arp, dst) =
   let pkt = Packet.to_string arp in
@@ -108,8 +106,8 @@ let create ?(timeout= 800) ?(retries= 5) ?src ?ipaddr eth =
   let ipaddr = Option.value ~default:Ipaddr.V4.any ipaddr in
   let cache = Hashtbl.create 0x10 in
   let t = { cache; macaddr; ipaddr; timeout; retries; epoch= 0; src; eth } in
-  begin if unknown == false
-        then let pkt, _ = alias t ipaddr in write t pkt end;
+  if unknown == false
+  then write t (alias t ipaddr);
   Ok t
 
 let _ips t =
@@ -119,12 +117,6 @@ let _ips t =
   Hashtbl.fold fn t.cache []
 
 let macaddr t = t.macaddr
-
-let _pending t ip =
-  match Hashtbl.find t.cache ip with
-  | exception Not_found -> None
-  | Pending (a, _) -> Some a
-  | _ -> None
 
 let request t dst_ip =
   let dst_mac = Macaddr.broadcast in
@@ -144,10 +136,13 @@ let reply arp macaddr =
   pkt, arp.Packet.src_mac
 
 exception Timeout
+exception Clear
 
 let empty_bt = Printexc.get_callstack 0
 let timeout = (Timeout, empty_bt)
-let wake c = ignore (Miou.Computation.try_cancel c timeout)
+let timeout c = ignore (Miou.Computation.try_cancel c timeout)
+let clear = (Clear, empty_bt)
+let clear c = ignore (Miou.Computation.try_cancel c clear)
 
 let tick t =
   let epoch = t.epoch in
@@ -164,7 +159,7 @@ let tick t =
   let outs, to_remove, timeouts = Hashtbl.fold fn t.cache ([], [], []) in
   List.iter (Hashtbl.remove t.cache) to_remove;
   List.iter (write t) outs;
-  List.iter wake timeouts;
+  List.iter timeout timeouts;
   t.epoch <- t.epoch + 1
 
 let handle_request t arp =
@@ -215,6 +210,7 @@ let input t pkt =
 
 let to_error (exn, _bt) = match exn with
   | Timeout -> `Timeout
+  | Clear -> `Clear
   | exn -> `Exn exn
 
 let query t ipaddr =
@@ -231,3 +227,34 @@ let query t ipaddr =
       |> Result.map_error to_error
   | Static (macaddr, _)
   | Dynamic (macaddr, _) -> Ok macaddr
+
+let ips t =
+  let fn k v acc = match v with
+    | Static (_, true) -> k :: acc
+    | _ -> acc in
+  Hashtbl.fold fn t.cache []
+
+let add_ip t ipaddr =
+  match ips t with
+  | [] ->
+      Hashtbl.iter (fun _ -> function
+        | Pending (w, _) -> clear w
+        | _ -> ()) t.cache;
+      Hashtbl.clear t.cache;
+      write t (alias t ipaddr)
+  | _ ->
+      write t (alias t ipaddr)
+
+let set_ips t = function
+  | [] ->
+      Hashtbl.iter (fun _ -> function
+        | Pending (w, _) -> clear w
+        | _ -> ()) t.cache;
+      Hashtbl.clear t.cache
+  | ipaddr :: rest ->
+      Hashtbl.iter (fun _ -> function
+        | Pending (w, _) -> clear w
+        | _ -> ()) t.cache;
+      Hashtbl.clear t.cache;
+      write t (alias t ipaddr);
+      List.iter (add_ip t) rest

@@ -1,17 +1,10 @@
-let src = Logs.Src.create "ethernet-miou-solo5"
-
-module Log = (val Logs.src_log src : Logs.LOG)
+[@@@warning "-30"]
 
 module Packet = struct
   type protocol =
     | ARPv4
     | IPv4
     | IPv6
-
-  let pp_protocol ppf = function
-    | ARPv4 -> Fmt.string ppf "ARPv4"
-    | IPv4 -> Fmt.string ppf "IPv4"
-    | IPv6 -> Fmt.string ppf "IPv6"
 
   type t =
     { src : Macaddr.t
@@ -36,11 +29,11 @@ module Packet = struct
     map beuint16 f g
 
   let t =
-    let fn src dst protocol =
+    let fn dst src protocol =
       { src; dst; protocol } in
     record fn
-    |+ field macaddr (fun t -> t.src)
     |+ field macaddr (fun t -> t.dst)
+    |+ field macaddr (fun t -> t.src)
     |+ field protocol (fun t -> t.protocol)
     |> sealr
 
@@ -69,11 +62,12 @@ type protocol = Packet.protocol =
 type t =
   { net : Miou_solo5.Net.t
   ; mutable handler : handler
-  ; frames : string packet Queue.t
+  ; frames : payload packet Queue.t
   ; mtu : int
   ; mac : Macaddr.t
   ; mutex : Miou.Mutex.t
   ; condition : Miou.Condition.t
+  ; src : Logs.src
   ; bstr_ic : Bstr.t
   ; bstr_oc : Bstr.t }
 and 'a packet =
@@ -82,6 +76,7 @@ and 'a packet =
   ; protocol : Packet.protocol
   ; payload : 'a }
 and handler = Bstr.t packet -> unit
+and payload = Simple of string | Multiple of string list
 
 type event = In of Bstr.t | Out
 
@@ -96,22 +91,39 @@ let read_or_write t =
     done; Out in
   Miou.await_first [ prm0; prm1 ] |> Result.get_ok
 
-let write t packet =
+let write t (packet : _ packet) payload =
   let src = Option.value ~default:t.mac packet.src in
   let pkt = { Packet.src; dst= packet.dst; protocol= Some packet.protocol } in
   try
     Packet.encode_into ~off:0 pkt t.bstr_oc;
-    let len = String.length packet.payload in
-    Bstr.blit_from_string packet.payload ~src_off:0 t.bstr_oc ~dst_off:14 ~len;
-    Log.debug (fun m -> m "write ethernet packet src:%a -> dst:%a"
+    let len = String.length payload in
+    Bstr.blit_from_string payload ~src_off:0 t.bstr_oc ~dst_off:14 ~len;
+    Logs.debug ~src:t.src (fun m -> m "write ethernet packet src:%a -> dst:%a"
       Macaddr.pp src Macaddr.pp packet.dst);
-    Log.debug (fun m -> m "@[<hov>%a@]"
+    Logs.debug ~src:t.src (fun m -> m "@[<hov>%a@]"
       (Hxd_string.pp Hxd.default) (Bstr.sub_string t.bstr_oc ~off:0 ~len:(14 + len)));
     Miou_solo5.Net.write_bigstring t.net ~off:0 ~len:(14 + len) t.bstr_oc
-  with exn -> Log.err (fun m -> m "Unexpected exception: %s" (Printexc.to_string exn))
+  with exn -> Logs.err ~src:t.src (fun m -> m "Unexpected exception: %s" (Printexc.to_string exn))
+
+let writev t (packet : _ packet) payloads =
+  let src = Option.value ~default:t.mac packet.src in
+  let pkt = { Packet.src; dst= packet.dst; protocol= Some packet.protocol } in
+  try
+    Packet.encode_into ~off:0 pkt t.bstr_oc;
+    let dst_off = ref 14 in
+    let fn src =
+      let len = String.length src in
+      Bstr.blit_from_string src ~src_off:0 t.bstr_oc ~dst_off:!dst_off ~len;
+      dst_off := !dst_off + len in
+    List.iter fn payloads;
+    Miou_solo5.Net.write_bigstring t.net ~off:0 ~len:!dst_off t.bstr_oc
+  with exn -> Logs.err ~src:t.src (fun m -> m "Unexpected exception: %s" (Printexc.to_string exn))
+
+let write t packet = match packet.payload with
+  | Simple payload -> write t packet payload
+  | Multiple sstr -> writev t packet sstr
 
 let rec daemon t =
-  Log.debug (fun m -> m "ethernet daemon tick");
   Queue.iter (write t) t.frames;
   Queue.clear t.frames;
   match read_or_write t with
@@ -127,14 +139,13 @@ let rec daemon t =
          then t.handler packet
          else begin
            let payload = Bstr.to_string payload in
-           Log.debug (fun m -> m "Ignore packet (src:%a -> dst:%a)" Macaddr.pp src Macaddr.pp dst);
-           Log.debug (fun m -> m "Protocol: %a" Packet.pp_protocol protocol);
-           Log.debug (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) payload)
+           Logs.debug ~src:t.src (fun m -> m "Ignore (%a -> %a):" Macaddr.pp src Macaddr.pp dst);
+           Logs.debug ~src:t.src (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) payload);
          end in
      let error _ =
        let str = Bstr.to_string payload in
-       Log.err (fun m -> m "Invalid Ethernet packet");
-       Log.err (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) str) in
+       Logs.err ~src:t.src (fun m -> m "Invalid Ethernet packet");
+       Logs.err ~src:t.src (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) str) in
      let () = Result.fold ~ok ~error (Packet.decode payload) in
      daemon t
 
@@ -152,8 +163,22 @@ let guard err fn = if fn () then Ok () else Error err
 let write t ?force ?src ~dst ~protocol payload =
   let ( let* ) = Result.bind in
   let* () = guard `Exceeds_MTU @@ fun () -> String.length payload <= t.mtu in
-  unsafe_write t ?force ?src ~dst ~protocol payload;
+  unsafe_write t ?force ?src ~dst ~protocol (Simple payload);
   Ok ()
+
+let writev t ?force ?src ~dst ~protocol sstr =
+  let ( let* ) = Result.bind in
+  let fn acc str = acc + String.length str in
+  let len = List.fold_left fn 0 sstr in
+  let* () = guard `Exceeds_MTU @@ fun () -> len <= t.mtu in
+  unsafe_write t ?force ?src ~dst ~protocol (Multiple sstr);
+  Ok ()
+
+let unsafe_writev t ?force ?src ~dst ~protocol sstr =
+  unsafe_write t ?force ?src ~dst ~protocol (Multiple sstr)
+
+let unsafe_write t ?force ?src ~dst ~protocol str =
+  unsafe_write t ?force ?src ~dst ~protocol (Simple str)
 
 type daemon = unit Miou.t
 
@@ -166,12 +191,14 @@ let create ?(mtu= 1500) ?(handler= ignore) mac net =
      [Bstr.sub] are cheap. We should use [Slice] instead of [Bstr]. TODO! *)
   let bstr_ic = Bstr.sub bstr_ic ~off:0 ~len:(14 + mtu) in
   let bstr_oc = Bstr.sub bstr_oc ~off:0 ~len:(14 + mtu) in
+  let src = Logs.Src.create (Macaddr.to_string mac) in
   let t =
     { net
     ; handler
     ; frames= Queue.create ()
     ; mtu
     ; mac
+    ; src
     ; mutex= Miou.Mutex.create ()
     ; condition= Miou.Condition.create ()
     ; bstr_ic
@@ -188,6 +215,6 @@ let set_handler t handler =
   Atomic.incr _cnt;
   t.handler <- handler;
   if Atomic.get _cnt > 1
-  then Log.warn (fun m -> m "Ethernet handler modified more than once")
+  then Logs.warn ~src:t.src (fun m -> m "Ethernet handler modified more than once")
 
 let kill = Miou.cancel
