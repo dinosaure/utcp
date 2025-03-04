@@ -68,6 +68,7 @@ type t =
   ; mutex : Miou.Mutex.t
   ; condition : Miou.Condition.t
   ; src : Logs.src
+  ; orphans : unit Miou.orphans
   ; bstr_ic : Bstr.t
   ; bstr_oc : Bstr.t }
 and 'a packet =
@@ -78,18 +79,27 @@ and 'a packet =
 and handler = Bstr.t packet -> unit
 and payload = Simple of string | Multiple of string list
 
+let copy (t : Bstr.t packet) =
+  { src= t.src; dst= t.dst; protocol= t.protocol; payload= Bstr.copy t.payload }
+
 type event = In of Bstr.t | Out
 
 let read_or_write t =
+  let prm1 = Miou.async @@ fun () ->
+    Miou.Mutex.protect t.mutex @@ fun () ->
+    Logs.debug ~src:t.src (fun m -> m "%d pending frame(s)"
+      (Queue.length t.frames));
+    if Queue.is_empty t.frames
+    then Miou.Condition.wait t.condition t.mutex;
+    Out in
   let prm0 = Miou.async @@ fun () ->
     let len = Miou_solo5.Net.read_bigstring t.net t.bstr_ic in
     In (Bstr.sub t.bstr_ic ~off:0 ~len) in
-  let prm1 = Miou.async @@ fun () ->
-    Miou.Mutex.protect t.mutex @@ fun () ->
-    while Queue.is_empty t.frames do
-      Miou.Condition.wait t.condition t.mutex
-    done; Out in
-  Miou.await_first [ prm0; prm1 ] |> Result.get_ok
+  match Miou.await_first [ prm0; prm1 ] with
+  | Ok value -> value
+  | Error exn ->
+      Logs.err ~src:t.src (fun m -> m "Unexpected exception: %s" (Printexc.to_string exn));
+      Out
 
 let write t (packet : _ packet) payload =
   let src = Option.value ~default:t.mac packet.src in
@@ -123,11 +133,23 @@ let write t packet = match packet.payload with
   | Simple payload -> write t packet payload
   | Multiple sstr -> writev t packet sstr
 
+let rec clean t = match Miou.care t.orphans with
+  | None | Some None -> ()
+  | Some (Some prm) ->
+      begin match Miou.await prm with
+      | Ok () -> clean t
+      | Error exn ->
+          Logs.err ~src:t.src (fun m -> m "Unexpected exception from the handler: %s"
+            (Printexc.to_string exn));
+          clean t end
+
 let rec daemon t =
+  Logs.debug ~src:t.src (fun m -> m "tick");
   Queue.iter (write t) t.frames;
   Queue.clear t.frames;
+  clean t;
   match read_or_write t with
-  | Out -> Miou.yield (); daemon t
+  | Out -> daemon t
   | In payload ->
      let ok ({ Packet.protocol; src; dst }, payload) =
        match protocol with
@@ -136,7 +158,7 @@ let rec daemon t =
          let packet = { src= Some src; dst; protocol; payload } in
          if Macaddr.compare dst t.mac == 0
          || Macaddr.is_unicast dst == false
-         then t.handler packet
+         then ignore (Miou.async ~orphans:t.orphans @@ fun () -> t.handler packet)
          else begin
            let payload = Bstr.to_string payload in
            Logs.debug ~src:t.src (fun m -> m "Ignore (%a -> %a):" Macaddr.pp src Macaddr.pp dst);
@@ -152,9 +174,10 @@ let rec daemon t =
 let unsafe_write t ?(force= true) ?src ~dst ~protocol payload =
   match force with
   | true ->
-    Miou.Mutex.protect t.mutex @@ fun () ->
+    Miou.Mutex.protect t.mutex @@ begin fun () ->
     Queue.push { src; dst; protocol; payload } t.frames;
-    Miou.Condition.signal t.condition
+    Miou.Condition.signal t.condition;
+    Logs.debug ~src:t.src (fun m -> m "wake-up the ethernet daemon") end
   | false ->
     Queue.push { src; dst; protocol; payload } t.frames
 
@@ -199,6 +222,7 @@ let create ?(mtu= 1500) ?(handler= ignore) mac net =
     ; mtu
     ; mac
     ; src
+    ; orphans= Miou.orphans ()
     ; mutex= Miou.Mutex.create ()
     ; condition= Miou.Condition.create ()
     ; bstr_ic

@@ -12,6 +12,8 @@ type 'a packet =
   ; protocol : protocol
   ; payload : 'a }
 
+val copy : Bstr.t packet -> Bstr.t packet
+
 type handler = Bstr.t packet -> unit
 
 val write :

@@ -185,11 +185,12 @@ let handle_reply t src macaddr =
       then Logs.debug ~src:t.src (fun m -> m "ignoring gratuitious ARP from %a using %a"
         Macaddr.pp macaddr Ipaddr.V4.pp src)
   | Dynamic (macaddr', _) ->
-      if Macaddr.compare macaddr macaddr' != 0
-      then Logs.debug ~src:t.src (fun m -> m "set %a from %a to %a"
+      Logs.debug ~src:t.src (fun m -> m "set %a from %a to %a"
         Ipaddr.V4.pp src Macaddr.pp macaddr' Macaddr.pp macaddr);
       Hashtbl.replace t.cache src entry
   | Pending (c, _) ->
+      Logs.debug ~src:t.src (fun m -> m "%a is-at %a"
+        Ipaddr.V4.pp src Macaddr.pp macaddr);
       ignore (Miou.Computation.try_return c macaddr);
       Hashtbl.replace t.cache src entry
 

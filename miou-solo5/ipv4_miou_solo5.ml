@@ -5,10 +5,6 @@ module Log = (val Logs.src_log src : Logs.LOG)
 module Flag = struct
   type t = DF | MF
 
-  let pp ppf = function
-    | DF -> Fmt.string ppf "DF"
-    | MF -> Fmt.string ppf "MF"
-
   let _dfmf = [ DF; MF ]
   let _df = [ DF ]
   let _mf = [ MF ]
@@ -117,7 +113,7 @@ module Packet = struct
       |> sealr
 
   let complete_and_without_options = t ~ihl:5 C
-  let partial = t ~ihl:5 P
+  let partial_and_without_options = t ~ihl:5 P
 
   let decode ?(off= 0) bstr =
     let version_and_ihl = Bstr.get_uint8 bstr off in
@@ -126,6 +122,9 @@ module Packet = struct
         let pos = off in
         let off = ref off in
         let pkt = decode_bstr complete_and_without_options bstr off in
+        (* TODO(dinosaure): not sure if we just need to compute the checksum
+           and compare it with [0x0000] or set the checksum field to [0],
+           compute it and compare with what we expect. *)
         Bstr.set_uint16_be bstr (pos + 10) 0;
         let chk = Utcp.Checksum.digest ~off:pos ~len:(!off - pos) bstr in
         if pkt.checksum_and_length.checksum != chk
@@ -143,7 +142,7 @@ module Packet = struct
     with _ -> Error `Invalid_IPv4_packet
 
   let to_bytes : partial packet -> bytes = fun pkt ->
-    Bytes.unsafe_of_string (to_string partial pkt)
+    Bytes.unsafe_of_string (to_string partial_and_without_options pkt)
 end
 
 module Fragments = struct
@@ -183,12 +182,7 @@ module Fragments = struct
     and protocol = to_protocol pkt.Packet.protocol
     and uid = pkt.Packet.uid
     and off = pkt.Packet.off * 8
-    and limit = not (List.exists ((==) Flag.MF) pkt.Packet.flags)
-    and chk = pkt.Packet.checksum_and_length.Packet.checksum in
-    let has = Utcp.Checksum.digest bstr in
-    Log.debug (fun m -> m "new incoming packet [%04x] from %a (flags: [%a], off: %d)"
-      uid Ipaddr.V4.pp src Fmt.(list ~sep:(any ";") Flag.pp) pkt.Packet.flags off);
-    Log.debug (fun m -> m "checksum: %04x (expected: %04x)" chk has);
+    and limit = not (List.exists ((==) Flag.MF) pkt.Packet.flags) in
     let str = Bstr.to_string bstr in
     let key = { Fragment.src; dst; protocol; uid } in
     match Table.find t.table key with
@@ -247,38 +241,44 @@ module Static = struct
             ; src } in
     Ok t
 
-  let write t ~finally ?(ttl= 38) ?src dst protocol ?(size= 0) sstr =
+  let write t ?(ttl= 38) ?src dst protocol sstr =
     let protocol = match protocol with
       | ICMP -> Packet.ICMP
       | TCP -> Packet.TCP
       | UDP -> Packet.UDP in
+    Logs.debug ~src:t.src (fun m -> m "Asking where is %a" Ipaddr.V4.pp dst);
     match Routing.destination_macaddr t.cidr t.gateway t.arp dst with
     | Error (`Exn _ | `Timeout | `Clear) ->
+        Logs.err ~src:t.src (fun m -> m "no route found for %a" Ipaddr.V4.pp dst);
         Error `Route_not_found
     | Error `Gateway ->
         Logs.debug ~src:t.src (fun m -> m "no gateway specified for writing IPv4 packets");
         Ok ()
     | Ok macaddr ->
         let mtu = Ethernet.mtu t.eth in
-        let len = 
+        let total_length = 
           let payload = List.fold_left (fun acc str -> String.length str + acc) 0 sstr in
-          20 (* ipv4 *) + size (* tcp / udp *) + payload in
-        if len <= mtu
-        then
+          20 (* ipv4 *) + payload in
+        if total_length <= mtu
+        then begin
+          Logs.debug ~src:t.src (fun m -> m "write %d byte(s) to %a:%a"
+            total_length Ipaddr.V4.pp dst Macaddr.pp macaddr);
           let src = Option.value ~default:(Ipaddr.V4.Prefix.address t.cidr) src in
           let pkt = { Packet.src; dst; uid= 0; flags= Flag._none; off= 0
                     ; ttl ; protocol; checksum_and_length= Packet.Partial
                     ; opt= Bstr.empty } in
           let pkt = Packet.to_bytes pkt in
-          let transport = finally sstr in
-          let chk = (* Checksum.digest_strs
-            (Bytes.unsafe_to_string pkt :: transport :: sstr) *) 0 in
-          Bytes.set_uint16_be pkt 2 len;
+          Bytes.set_uint16_be pkt 2 total_length;
+          let chk = Utcp.Checksum.digest_strings
+            (Bytes.unsafe_to_string pkt :: sstr) in
           Bytes.set_uint16_be pkt 10 chk;
           Ethernet.unsafe_writev t.eth ~dst:macaddr ~protocol:Ethernet.IPv4
-            (Bytes.unsafe_to_string pkt :: transport :: sstr);
+            (Bytes.unsafe_to_string pkt :: sstr);
           Ok ()
-        else assert false (* fragment *)
+        end else begin
+          Log.err (fun m -> m "Impossible to send this IPv4 packet, too huge.");
+          assert false (* fragment *)
+        end
 
   let input t pkt =
     match Packet.decode pkt.Ethernet.payload with
@@ -299,7 +299,8 @@ module Static = struct
           Logs.debug ~src:t.src (fun m -> m "Incoming IPv4 packet from %a"
             Ipaddr.V4.pp ipv4.Packet.src);
           Fragments.insert t.cache ipv4 payload;
-          t.handler (Fragments.get t.cache)
+          let pkts = Fragments.get t.cache in
+          t.handler pkts 
         end else Logs.debug ~src:t.src (fun m -> m "drop IPv4 packet (%a -> %a)"
           Ipaddr.V4.pp ipv4.Packet.src Ipaddr.V4.pp ipv4.Packet.dst)
 

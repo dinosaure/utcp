@@ -24,12 +24,10 @@ module Static : sig
 
   val write :
        t
-    -> finally:(string list -> string)
     -> ?ttl:int
     -> ?src:Ipaddr.V4.t
     -> Ipaddr.V4.t
     -> protocol
-    -> ?size:int
     -> string list
     -> (unit, [> `Route_not_found ]) result
 
