@@ -42,8 +42,8 @@ module Packet = struct
     |+ field ipaddr (fun t -> t.dst_ip)
     |> sealr
 
-  let decode ?(off= 0) bstr =
-    try Ok (decode_bstr t bstr (ref off))
+  let decode ?(off= 0) str =
+    try Ok (decode t str (ref off))
     with _exn -> Error `Invalid_ARPv4_packet
 
   let to_string value = to_string t value
@@ -185,7 +185,8 @@ let handle_reply t src macaddr =
       then Logs.debug ~src:t.src (fun m -> m "ignoring gratuitious ARP from %a using %a"
         Macaddr.pp macaddr Ipaddr.V4.pp src)
   | Dynamic (macaddr', _) ->
-      Logs.debug ~src:t.src (fun m -> m "set %a from %a to %a"
+      if Macaddr.compare macaddr macaddr' != 0
+      then Logs.debug ~src:t.src (fun m -> m "set %a from %a to %a"
         Ipaddr.V4.pp src Macaddr.pp macaddr' Macaddr.pp macaddr);
       Hashtbl.replace t.cache src entry
   | Pending (c, _) ->
@@ -197,9 +198,9 @@ let handle_reply t src macaddr =
 let input t pkt =
   match Packet.decode pkt.Ethernet.payload with
   | Error _ ->
-      let str = Bstr.to_string pkt.payload in
       Logs.err ~src:t.src (fun m -> m "Invalid ARPv4 packet:");
-      Logs.err ~src:t.src (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) str)
+      Logs.err ~src:t.src (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default)
+        pkt.Ethernet.payload)
   | Ok arp ->
       if Ipaddr.V4.compare arp.Packet.src_ip arp.Packet.dst_ip == 0
       || arp.Packet.operation == Packet.Reply
@@ -213,6 +214,16 @@ let to_error (exn, _bt) = match exn with
   | Timeout -> `Timeout
   | Clear -> `Clear
   | exn -> `Exn exn
+
+type error =
+  [ `Timeout
+  | `Clear
+  | `Exn of exn ]
+
+let pp_error ppf = function
+  | `Timeout -> Fmt.string ppf "Timeout"
+  | `Clear -> Fmt.string ppf "ARP table reset"
+  | `Exn exn -> Fmt.pf ppf "Unexpected exception: %s" (Printexc.to_string exn)
 
 let query t ipaddr =
   match Hashtbl.find t.cache ipaddr with

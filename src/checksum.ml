@@ -115,13 +115,11 @@ let unsafe_digest_16_le ?(off = 0) ~len:top buf sum =
   let i = ref 0 in
   while !len >= 2 do
     sum := !sum + get_uint16_ne buf (!i * 2);
-    if !sum > 0xffff then incr sum;
-    sum := !sum land 0xffff;
     incr i;
     len := !len - 2
   done;
   if !len = 1 then sum := !sum + get_uint8 buf (off + top - 1);
-  if !sum > 0xffff then incr sum; !sum
+  !sum
 
 let unsafe_digest_16_be ?(off = 0) ~len:top buf sum =
   let len = ref top in
@@ -129,13 +127,11 @@ let unsafe_digest_16_be ?(off = 0) ~len:top buf sum =
   let i = ref 0 in
   while !len >= 2 do
     sum := !sum + swap16 (get_uint16_ne buf (!i * 2));
-    if !sum > 0xffff then incr sum;
-    sum := !sum land 0xffff;
     incr i;
     len := !len - 2
   done;
   if !len = 1 then sum := !sum + get_uint8 buf (off + top - 1);
-  if !sum > 0xffff then incr sum; !sum
+  !sum
 
 let digest_string ?(off= 0) ?len str =
   let len = match len with
@@ -149,7 +145,12 @@ let digest_string ?(off= 0) ?len str =
     if Sys.big_endian
     then unsafe_digest_16_be ~off ~len str 0
     else unsafe_digest_16_le ~off ~len str 0 in
-  swap16 (lnot sum land 0xffff)
+  let sum = ref sum in
+  let car = ref 0 in
+  while car := !sum lsr 16; !car != 0 do
+    sum := (!sum land 0xffff) + !car;
+  done;
+  swap16 (lnot !sum land 0xffff)
 
 let digest_strings sstr =
   let fn = match Sys.big_endian with
@@ -158,4 +159,9 @@ let digest_strings sstr =
     | false -> fun sum str ->
         unsafe_digest_16_le ~off:0 ~len:(String.length str) str sum in
   let sum = List.fold_left fn 0 sstr in
-  swap16 (lnot sum land 0xffff)
+  let sum = ref sum in
+  let car = ref 0 in
+  while car := !sum lsr 16; !car != 0 do
+    sum := (!sum land 0xffff) + !car;
+  done;
+  swap16 (lnot !sum land 0xffff)

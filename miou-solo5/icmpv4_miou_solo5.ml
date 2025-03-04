@@ -139,8 +139,6 @@ let handler ipv4 pkt payload =
       | Packet.Echo_request ->
           let pkt = { Packet.code= 0; kind= Echo_reply; checksum= 0; shdr= pkt.shdr } in
           let buf = Packet.to_bytes pkt in
-          Log.debug (fun m -> m "ICMPv4 packet to send:");
-          Log.debug (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) (String.concat "" [ Bytes.unsafe_to_string buf; payload ]));
           let chk = Utcp.Checksum.digest_strings [ Bytes.unsafe_to_string buf; payload ] in
           Bytes.set_uint16_be buf 2 chk;
           let pkt = Bytes.unsafe_to_string buf in

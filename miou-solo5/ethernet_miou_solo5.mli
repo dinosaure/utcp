@@ -12,7 +12,7 @@ type 'a packet =
   ; protocol : protocol
   ; payload : 'a }
 
-val copy : Bstr.t packet -> Bstr.t packet
+val packet_to_string : Bstr.t packet -> string packet
 
 type handler = Bstr.t packet -> unit
 

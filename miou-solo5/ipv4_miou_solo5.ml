@@ -215,6 +215,33 @@ end
 module Ethernet = Ethernet_miou_solo5
 module ARPv4 = Arp_miou_solo5
 
+let shift str n =
+  let len = String.length str in
+  String.sub str n (len - n)
+
+let split_on ~fragment sstr =
+  let total = List.fold_left (fun acc str -> String.length str + acc) 0 sstr in
+  let lens = 1 + ((total - 1) / fragment) in
+  let bufs = Array.init lens (fun _ -> Bytes.create fragment) in
+  let sstr = ref sstr in
+  let dst_off = ref 0 in
+  let idx = ref 0 in
+  while !idx < lens && !sstr != [] do
+    let str = List.hd !sstr in
+    let len = Int.min (String.length str) (fragment - !dst_off) in
+    Bytes.blit_string str 0 bufs.(!idx) !dst_off len;
+    if !dst_off + len == fragment
+    then begin dst_off := 0; incr idx end
+    else dst_off := !dst_off + len;
+    if len == String.length str
+    then sstr := List.tl !sstr
+    else sstr := (shift str len) :: (List.tl !sstr)
+  done;
+  if !dst_off < fragment
+  then bufs.(lens - 1) <- Bytes.sub bufs.(lens - 1) 0 !dst_off;
+  Logs.debug (fun m -> m "Fragmentation done");
+  Array.to_list bufs |> List.map Bytes.unsafe_to_string
+
 module Static = struct
   type packet = Fragment.t =
     { src : Ipaddr.V4.t
@@ -233,15 +260,19 @@ module Static = struct
     ; mutable handler : (packet * string) list -> unit
     ; src : Logs.src }
 
+  let guard err fn = if fn () then Ok () else Error err
+
   let create ?cache:max ?to_expire eth arp ?gateway ?(handler= ignore) cidr =
     let src = Logs.Src.create (Ipaddr.V4.Prefix.to_string cidr) in
     let t = { eth; arp; cidr; gateway
             ; cache= Fragments.create ?max ?to_expire ()
             ; handler
             ; src } in
+    let ( let* ) = Result.bind in
+    let* () = guard `MTU_too_small @@ fun () -> Ethernet.mtu eth >= 20 + 1 in
     Ok t
 
-  let write t ?(ttl= 38) ?src dst protocol sstr =
+  let write t ?(ttl= 38) ?src dst protocol ?(finally= Fun.const "") ?(size= 0) sstr =
     let protocol = match protocol with
       | ICMP -> Packet.ICMP
       | TCP -> Packet.TCP
@@ -255,29 +286,60 @@ module Static = struct
         Logs.debug ~src:t.src (fun m -> m "no gateway specified for writing IPv4 packets");
         Ok ()
     | Ok macaddr ->
+        let src = Option.value ~default:(Ipaddr.V4.Prefix.address t.cidr) src in
         let mtu = Ethernet.mtu t.eth in
         let total_length = 
           let payload = List.fold_left (fun acc str -> String.length str + acc) 0 sstr in
-          20 (* ipv4 *) + payload in
+          20 (* ipv4 *) + size + payload in
         if total_length <= mtu
         then begin
           Logs.debug ~src:t.src (fun m -> m "write %d byte(s) to %a:%a"
             total_length Ipaddr.V4.pp dst Macaddr.pp macaddr);
-          let src = Option.value ~default:(Ipaddr.V4.Prefix.address t.cidr) src in
           let pkt = { Packet.src; dst; uid= 0; flags= Flag._none; off= 0
                     ; ttl ; protocol; checksum_and_length= Packet.Partial
                     ; opt= Bstr.empty } in
           let pkt = Packet.to_bytes pkt in
           Bytes.set_uint16_be pkt 2 total_length;
-          let chk = Utcp.Checksum.digest_strings
-            (Bytes.unsafe_to_string pkt :: sstr) in
+          let hdr = finally (Bytes.unsafe_to_string pkt) in
+          let chk = Utcp.Checksum.digest_string
+            (Bytes.unsafe_to_string pkt) in
           Bytes.set_uint16_be pkt 10 chk;
           Ethernet.unsafe_writev t.eth ~dst:macaddr ~protocol:Ethernet.IPv4
-            (Bytes.unsafe_to_string pkt :: sstr);
+            (Bytes.unsafe_to_string pkt :: hdr :: sstr);
           Ok ()
         end else begin
-          Log.err (fun m -> m "Impossible to send this IPv4 packet, too huge.");
-          assert false (* fragment *)
+          let fragment = (mtu - 20) land (lnot 0b111) in
+          Logs.debug ~src:t.src (fun m -> m "Fragment to %d byte(s)" fragment);
+          let uid = Mirage_crypto_rng.generate 2 in
+          let uid = String.get_uint16_be uid 0 in
+          let pkt = { Packet.src; dst; uid; flags= Flag._mf; off= 0
+                    ; ttl; protocol; checksum_and_length= Packet.Partial
+                    ; opt= Bstr.empty } in
+          let pkt = Packet.to_bytes pkt in
+          Bytes.set_uint16_be pkt 2 (20 + fragment);
+          let hdr = finally (Bytes.unsafe_to_string pkt) in
+          let[@warning "-8"] first :: payloads = split_on ~fragment (hdr :: sstr) in
+          let chk = Utcp.Checksum.digest_string
+            (Bytes.unsafe_to_string pkt) in
+          Bytes.set_uint16_be pkt 10 chk;
+          Ethernet.unsafe_writev t.eth ~dst:macaddr ~protocol:Ethernet.IPv4
+            [ Bytes.unsafe_to_string pkt; first ];
+          let rec go off = function
+            | [] -> Ok ()
+            | payload :: rest ->
+                let flags = if rest == [] then Flag._none else Flag._mf in
+                let pkt = { Packet.src; dst; uid; flags; off= off / 8
+                          ; ttl; protocol; checksum_and_length= Packet.Partial
+                          ; opt= Bstr.empty } in
+                let pkt = Packet.to_bytes pkt in
+                Bytes.set_uint16_be pkt 2 (20 + String.length payload);
+                let chk = Utcp.Checksum.digest_strings
+                  [ Bytes.unsafe_to_string pkt ] in
+                Bytes.set_uint16_be pkt 10 chk;
+                Ethernet.unsafe_writev t.eth ~dst:macaddr ~protocol:Ethernet.IPv4
+                  [ Bytes.unsafe_to_string pkt; payload ];
+                go (off + String.length payload) rest in
+          go (String.length first) payloads
         end
 
   let input t pkt =
