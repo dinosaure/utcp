@@ -4,7 +4,7 @@ type seq =
 type node =
   { mutable prev : seq
   ; mutable next : seq
-  ; key : Fragment.t
+  ; key : Fragment.header
   ; idx : int
   ; mutable active : bool }
 
@@ -89,21 +89,21 @@ let node_of_key t ~key =
   let seq = ref root.next in
   if root == !seq
   then raise_notrace Not_found ;
-  if Fragment.compare (node_of_seq !seq).key key == 0
+  if Stdlib.compare (node_of_seq !seq).key key == 0
   && (node_of_seq !seq).active
   then node_of_seq !seq
   else begin
     seq := !seq.next;
     if root == !seq
     then raise_notrace Not_found ;
-    if Fragment.compare (node_of_seq !seq).key key == 0
+    if Stdlib.compare (node_of_seq !seq).key key == 0
     && (node_of_seq !seq).active
     then node_of_seq !seq
     else begin
       seq := !seq.next;
       if root == !seq
       then raise_notrace Not_found;
-      if Fragment.compare (node_of_seq !seq).key key == 0
+      if Stdlib.compare (node_of_seq !seq).key key == 0
       then node_of_seq !seq
       else go key root !seq.next
     end

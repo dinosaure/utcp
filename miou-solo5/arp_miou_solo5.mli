@@ -8,17 +8,22 @@ type error =
 val pp_error : error Fmt.t
 
 type t
+type daemon
 
 val create :
-     ?timeout:int
+     ?delay:int
+  -> ?timeout:int
   -> ?retries:int
   -> ?src:Logs.Src.t
   -> ?ipaddr:Ipaddr.V4.t
   -> Ethernet.t
-  -> (t, [> `MTU_too_small ]) result
+  -> (daemon * t, [> `MTU_too_small ]) result
 
 val macaddr : t -> Macaddr.t
-val input : t -> string Ethernet.packet -> unit
-val tick : t -> unit
 val set_ips : t -> Ipaddr.V4.t list -> unit
 val query : t -> Ipaddr.V4.t -> (Macaddr.t, [> error ]) result
+
+(** ARPv4 daemon *)
+
+val transfer : t -> Bstr.t Ethernet.packet -> unit
+val kill : daemon -> unit

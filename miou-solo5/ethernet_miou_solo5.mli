@@ -1,6 +1,8 @@
 type t
 type daemon
 
+val mac : t -> Macaddr.t
+
 type protocol =
   | ARPv4
   | IPv4
@@ -11,8 +13,6 @@ type 'a packet =
   ; dst : Macaddr.t
   ; protocol : protocol
   ; payload : 'a }
-
-val packet_to_string : Bstr.t packet -> string packet
 
 type handler = Bstr.t packet -> unit
 
@@ -60,12 +60,25 @@ val unsafe_writev :
   -> string list
   -> unit
 
+val write_into :
+     t
+  -> ?force:bool
+  -> ?src:Macaddr.t
+  -> dst:Macaddr.t
+  -> protocol:protocol
+  -> (Bstr.t -> int)
+  -> unit
+
 val create :
      ?mtu:int
   -> ?handler:(Bstr.t packet -> unit)
   -> Macaddr.t
   -> Miou_solo5.Net.t
   -> (daemon * t, [> `MTU_too_small ]) result
+(** NOTE(dinosaure): Note that the handler managing the Ethernet frames does not
+    run cooperatively but from the main task that manages all the I/O. In other
+    words, it is not possible to write a new frame from the [handler]. This must
+    be done "outside" (in another task), otherwise a deadlock may occur. *)
 
 val kill : daemon -> unit
 val mtu : t -> int

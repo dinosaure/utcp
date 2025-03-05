@@ -128,8 +128,8 @@ end
 
 module IPv4 = Ipv4_miou_solo5
 
-let handler ipv4 pkt payload =
-  let dst = pkt.IPv4.Static.src in
+let input ipv4 pkt payload =
+  let dst = pkt.IPv4.src in
   match Packet.decode payload with
   | Error _ ->
       Logs.err (fun m -> m "Invalid ICMPv4 packet:");
@@ -142,9 +142,60 @@ let handler ipv4 pkt payload =
           let chk = Utcp.Checksum.digest_strings [ Bytes.unsafe_to_string buf; payload ] in
           Bytes.set_uint16_be buf 2 chk;
           let pkt = Bytes.unsafe_to_string buf in
-          let result = IPv4.Static.write ipv4 dst IPv4.Static.ICMP [ pkt; payload ] in
+          let pkt = IPv4.Writer.of_strings ipv4 [ pkt; payload ] in
+          let result = IPv4.write ipv4 dst IPv4.ICMP pkt in
           let err _ =
             Log.err (fun m -> m "Impossible to send ICMPv4 echo-reply packet") in
           let _ = Result.map_error err result in ()
       | _ ->
           Log.debug (fun m -> m "Ignore ICMPv4 packet") end
+
+type t =
+  { mutex : Miou.Mutex.t
+  ; condition : Miou.Condition.t
+  ; queue : (IPv4.packet * string) Queue.t
+  ; ipv4 : IPv4.t
+  ; orphans : unit Miou.orphans }
+
+let rec clean orphans =
+  match Miou.care orphans with
+  | None | Some None -> ()
+  | Some (Some prm) ->
+      match Miou.await prm with
+      | Ok () -> clean orphans
+      | Error exn ->
+          Logs.err (fun m -> m "Unexpected exception from an ICMPv4 task: %s"
+            (Printexc.to_string exn));
+          clean orphans
+
+let rec handler t =
+  clean t.orphans;
+  let todo = Miou.Mutex.protect t.mutex @@ fun () ->
+    while Queue.is_empty t.queue
+    do Miou.Condition.wait t.condition t.mutex done;
+    let todo = Queue.create () in
+    Queue.transfer t.queue todo; todo in
+  let fn (pkt, payload) =
+    ignore (Miou.async ~orphans:t.orphans @@ fun () -> input t.ipv4 pkt payload) in
+  Queue.iter fn todo;
+  handler t
+
+type daemon = unit Miou.t * t
+
+let handler ipv4 : daemon =
+  let mutex = Miou.Mutex.create () in
+  let condition = Miou.Condition.create () in
+  let queue = Queue.create () in
+  let orphans = Miou.orphans () in
+  let t = { mutex; condition; queue; ipv4; orphans } in
+  Miou.async (fun () -> handler t), t
+
+let kill (prm, _) = Miou.cancel prm
+
+let transfer (_, t) (pkt, payload) =
+  let payload = match payload with
+    | IPv4.Bstr bstr -> Bstr.to_string bstr
+    | IPv4.String str -> str in
+  Miou.Mutex.protect t.mutex @@ fun () ->
+  Queue.push (pkt, payload) t.queue;
+  Miou.Condition.signal t.condition

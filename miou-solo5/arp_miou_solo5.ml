@@ -45,8 +45,6 @@ module Packet = struct
   let decode ?(off= 0) str =
     try Ok (decode t str (ref off))
     with _exn -> Error `Invalid_ARPv4_packet
-
-  let to_string value = to_string t value
 end
 
 let mac0 = Macaddr.of_octets_exn (String.make 6 '\000')
@@ -66,7 +64,10 @@ type t =
   ; retries : int
   ; mutable epoch : int
   ; src : Logs.src
-  ; eth : Ethernet.t }
+  ; eth : Ethernet.t
+  ; mutex : Miou.Mutex.t
+  ; condition : Miou.Condition.t
+  ; queue : string Ethernet.packet Queue.t }
 
 let alias t ipaddr =
   let () = match Hashtbl.find t.cache ipaddr with
@@ -83,39 +84,10 @@ let alias t ipaddr =
   (pkt, Macaddr.broadcast)
 
 let write t (arp, dst) =
-  let pkt = Packet.to_string arp in
-  (* NOTE(dinosaure): During construction, we verified that we could write ARP
-     packets and that we would not exceed the MTU. *)
-  Ethernet.unsafe_write t.eth ~dst ~protocol:Ethernet.ARPv4 pkt
+  let fn bstr = Bin.encode_bstr Packet.t arp bstr (ref 0); 28 in
+  Ethernet.write_into t.eth ~dst ~protocol:Ethernet.ARPv4 fn
 
 let guard err fn = if fn () then Ok () else Error err
-
-let create ?(timeout= 800) ?(retries= 5) ?src ?ipaddr eth =
-  let ( let* ) = Result.bind in
-  let macaddr = Ethernet.macaddr eth in
-  (* enough for ARP packets *)
-  let* () = guard `MTU_too_small @@ fun () -> Ethernet.mtu eth >= 28 in
-  let src = match src with
-    | None -> Logs.Src.create (Fmt.str "%a" Macaddr.pp macaddr)
-    | Some src -> src in
-  if timeout <= 0
-  then Fmt.invalid_arg "Arp_miou_solo5.create: null or negative timeout";
-  if retries < 0
-  then Fmt.invalid_arg "Arg_miou_solo5.create: negative retries value";
-  let unknown = Option.is_none ipaddr in
-  let ipaddr = Option.value ~default:Ipaddr.V4.any ipaddr in
-  let cache = Hashtbl.create 0x10 in
-  let t = { cache; macaddr; ipaddr; timeout; retries; epoch= 0; src; eth } in
-  if unknown == false
-  then write t (alias t ipaddr);
-  Ok t
-
-let _ips t =
-  let fn ip entry acc = match entry with
-    | Static (_, true) -> ip :: acc
-    | _ -> acc in
-  Hashtbl.fold fn t.cache []
-
 let macaddr t = t.macaddr
 
 let request t dst_ip =
@@ -270,3 +242,73 @@ let set_ips t = function
       Hashtbl.clear t.cache;
       write t (alias t ipaddr);
       List.iter (add_ip t) rest
+
+type daemon = unit Miou.t
+
+type event =
+  | In of string Ethernet.packet Queue.t
+  | Tick
+
+let read_or_sync ?(delay= 1_500_000_000) t =
+  let prm1 = Miou.async @@ fun () ->
+    Miou.Mutex.protect t.mutex @@ fun () ->
+    if Queue.is_empty t.queue
+    then Miou.Condition.wait t.condition t.mutex;
+    let todo = Queue.create () in
+    Queue.transfer t.queue todo; In todo in
+  let prm0 = Miou.async @@ fun () ->
+    Miou_solo5.sleep delay;
+    Tick in
+  match Miou.await_first [ prm0; prm1 ] with
+  | Ok value -> value
+  | Error exn ->
+      Logs.err ~src:t.src (fun m -> m "Unexpected exception: %s"
+        (Printexc.to_string exn));
+      In (Queue.create ())
+
+let arp ?(delay= 1_500_000_000) t =
+  let rec go rem =
+    let t0 = Miou_solo5.clock_monotonic () in
+    match read_or_sync ~delay:rem t with
+    | In queue ->
+      let fn = input t in
+      Queue.iter fn queue;
+      let t1 = Miou_solo5.clock_monotonic () in
+      let rem = rem - (t1 - t0) in
+      let rem = if rem <= 0 then delay else rem in
+      go rem
+    | Tick -> tick t; go delay in
+  go delay
+
+let create ?(delay= 1_500_000_000) ?(timeout= 800) ?(retries= 5) ?src ?ipaddr eth =
+  let ( let* ) = Result.bind in
+  let macaddr = Ethernet.macaddr eth in
+  (* enough for ARP packets *)
+  let* () = guard `MTU_too_small @@ fun () -> Ethernet.mtu eth >= 28 in
+  let src = match src with
+    | None -> Logs.Src.create (Fmt.str "%a" Macaddr.pp macaddr)
+    | Some src -> src in
+  if timeout <= 0
+  then Fmt.invalid_arg "Arp_miou_solo5.create: null or negative timeout";
+  if retries < 0
+  then Fmt.invalid_arg "Arg_miou_solo5.create: negative retries value";
+  let unknown = Option.is_none ipaddr in
+  let ipaddr = Option.value ~default:Ipaddr.V4.any ipaddr in
+  let cache = Hashtbl.create 0x10 in
+  let t = { cache; macaddr; ipaddr; timeout; retries; epoch= 0; src; eth
+          ; mutex= Miou.Mutex.create ()
+          ; condition= Miou.Condition.create ()
+          ; queue= Queue.create () } in
+  if unknown == false
+  then write t (alias t ipaddr);
+  let prm = Miou.async (fun () -> arp ~delay t) in
+  Ok (prm, t)
+
+let transfer t pkt =
+  let payload = Bstr.sub_string pkt.Ethernet.payload ~off:0 ~len:28 in
+  let pkt = { pkt with Ethernet.payload } in
+  Miou.Mutex.protect t.mutex @@ fun () ->
+  Queue.push pkt t.queue;
+  Miou.Condition.signal t.condition
+
+let kill = Miou.cancel
