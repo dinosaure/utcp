@@ -17,6 +17,42 @@ type 'a payload =
   | Unfragmented : Bstr.t -> unfragmented payload
 
 type t = Payload : 'a payload -> t [@@unboxed]
+(* A payload can be:
+   - an entire packet (Unfragmented)
+   - the start of a fragment whose end is unknown (Unsized)
+   - a packet that has not yet been fully received (but which size is known) (Sized)
+
+   In the case of a fragment whose size is unknown, a Rope is used so that
+   insertion at random locations is not costly. This Rope is in a state where we
+   do not know the final size ([Ropes.unknown]). We can therefore add fragments
+   one after the other "ad infinitum". However, we cannot add a fragment on top
+   of another existing one. If this is the case, the addition raises the
+   [Overlap] exception.
+
+   Then, if we know the last fragment, we know the final size of our packet. We
+   can therefore [Ropes.fix] our ropes. This consists of creating a final buffer
+   in which we will copy all our fragments (a reassembly, in short). However,
+   this does not mean that we have received the whole of our package; there may
+   be holes.
+
+   It is therefore always necessary to check that the addition of new fragments
+   to this buffer does not overlap other already existing fragments. For this
+   reason, we associate with this buffer a Discrete Interval Encoding Tree that
+   contains all the intervals already "filled" in our buffer. A [Sized] value is
+   then created.
+
+   Thanks to the DIET, we can verify that the addition of all these intervals
+   forms a continuous final interval of our packet in its entirety. All we have
+   to do is make a [Diet.diff] between our current DIET and the one that
+   contains this final interval. If the result is empty, it means that our
+   current DIET contains all the intervals necessary to complete our buffer. Our
+   packet is complete!
+
+   Finally, there is the special case of an unfragmented packet. This
+   corresponds to our "happy path" where the bigstring used physically
+   corresponds to the one used (and filled) by Solo5. That is to say that from
+   Solo5 up to here, this unfragmented packet **is not** a copy.
+*)
 
 let singleton ~off ?(limit= false) str : t =
   let empty = Ropes.(Unknown Limitless) in

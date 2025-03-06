@@ -1,3 +1,28 @@
+(* This module can be seen as a reimplementation of [Hashtbl] with a specialized
+   key that corresponds to the header of IPv4 packets. The advantage of this
+   implementation is:
+   1) the performance compared to [Hashtbl] for searching for a fragment
+      according to its header is equivalent
+   2) the deletion of an element from the [Table] because the packet seems
+      corrupted is in O(1) as long as it has already been found
+
+   For the second point, we know that deletion occurs in 2 cases:
+   - the case where the packet found in the table is corrupted, in which case we
+     are faster than [Hashtbl.find; Hashtbl.remove].
+   - the case where we have to remove expired packets (which corresponds to
+     [Hashtbl.iter (Hashtbl.remove)]).
+
+   To achieve this result, instead of using a simple list as is the case in
+   [Hashtbl], a doubly linked list is used, which makes it possible to delete an
+   element without having to go through the [Hashtbl] again as long as there is
+   a representation of this element in the [Table] (a [node]).
+
+   Finally, a last difference compared to [Hashtbl] is that the maximum number
+   of elements that can be stored in the [Table] is fixed! It is not really a
+   LRU cache (there is no promotion of elements according to information) but
+   the memory usage of this [table] should also be fixed.
+*)
+
 type seq =
   { mutable prev : seq; mutable next : seq }
 
