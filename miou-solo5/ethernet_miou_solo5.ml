@@ -62,7 +62,7 @@ type protocol = Packet.protocol =
 type t =
   { net : Miou_solo5.Net.t
   ; mutable handler : handler
-  ; frames : payload packet Queue.t
+  ; frames : (Bstr.t -> int) packet Queue.t
   ; mtu : int
   ; mac : Macaddr.t
   ; mutex : Miou.Mutex.t
@@ -76,7 +76,6 @@ and 'a packet =
   ; protocol : Packet.protocol
   ; payload : 'a }
 and handler = Bstr.t packet -> unit
-and payload = Simple of string | Multiple of string list | Into of (Bstr.t -> int)
 
 let mac { mac; _ } = mac
 
@@ -97,31 +96,8 @@ let read_or_write t =
       Logs.err ~src:t.src (fun m -> m "Unexpected exception: %s" (Printexc.to_string exn));
       Out
 
-let write t (packet : _ packet) payload =
-  let src = Option.value ~default:t.mac packet.src in
-  let pkt = { Packet.src; dst= packet.dst; protocol= Some packet.protocol } in
-  Packet.encode_into ~off:0 pkt t.bstr_oc;
-  let len = String.length payload in
-  Bstr.blit_from_string payload ~src_off:0 t.bstr_oc ~dst_off:14 ~len;
-  Logs.debug ~src:t.src (fun m -> m "write ethernet packet src:%a -> dst:%a"
-    Macaddr.pp src Macaddr.pp packet.dst);
-  Logs.debug ~src:t.src (fun m -> m "@[<hov>%a@]"
-    (Hxd_string.pp Hxd.default) (Bstr.sub_string t.bstr_oc ~off:0 ~len:(14 + len)));
-  Miou_solo5.Net.write_bigstring t.net ~off:0 ~len:(14 + len) t.bstr_oc
-
-let writev t (packet : _ packet) payloads =
-  let src = Option.value ~default:t.mac packet.src in
-  let pkt = { Packet.src; dst= packet.dst; protocol= Some packet.protocol } in
-  Packet.encode_into ~off:0 pkt t.bstr_oc;
-  let dst_off = ref 14 in
-  let fn src =
-    let len = String.length src in
-    Bstr.blit_from_string src ~src_off:0 t.bstr_oc ~dst_off:!dst_off ~len;
-    dst_off := !dst_off + len in
-  List.iter fn payloads;
-  Miou_solo5.Net.write_bigstring t.net ~off:0 ~len:!dst_off t.bstr_oc
-
-let write_into t (packet : _ packet) fn =
+let write_into t (packet : (Bstr.t -> int) packet) =
+  let fn = packet.payload in
   let src = Option.value ~default:t.mac packet.src in
   let pkt = { Packet.src; dst= packet.dst; protocol= Some packet.protocol } in
   Packet.encode_into ~off:0 pkt t.bstr_oc;
@@ -133,13 +109,8 @@ let write_into t (packet : _ packet) fn =
     (Hxd_string.pp Hxd.default) (Bstr.sub_string t.bstr_oc ~off:0 ~len:(14 + plus)));
   Miou_solo5.Net.write_bigstring t.net ~off:0 ~len:(14 + plus) t.bstr_oc
 
-let write t packet = match packet.payload with
-  | Simple payload -> write t packet payload
-  | Multiple sstr -> writev t packet sstr
-  | Into fn -> write_into t packet fn
-
 let rec daemon t =
-  Queue.iter (write t) t.frames;
+  Queue.iter (write_into t) t.frames;
   Queue.clear t.frames;
   match read_or_write t with
   | Out -> daemon t
@@ -168,39 +139,16 @@ let rec daemon t =
      let () = Result.fold ~ok ~error (Packet.decode payload) in
      daemon t
 
-let unsafe_write t ?(force= true) ?src ~dst ~protocol payload =
+let write_into t ?(force= true) ?src ~dst ~protocol fn =
   match force with
   | true ->
     Miou.Mutex.protect t.mutex @@ fun () ->
-    Queue.push { src; dst; protocol; payload } t.frames;
+    Queue.push { src; dst; protocol; payload= fn } t.frames;
     Miou.Condition.signal t.condition
   | false ->
-    Queue.push { src; dst; protocol; payload } t.frames
+    Queue.push { src; dst; protocol; payload= fn } t.frames
 
 let guard err fn = if fn () then Ok () else Error err
-
-let write t ?force ?src ~dst ~protocol payload =
-  let ( let* ) = Result.bind in
-  let* () = guard `Exceeds_MTU @@ fun () -> String.length payload <= t.mtu in
-  unsafe_write t ?force ?src ~dst ~protocol (Simple payload);
-  Ok ()
-
-let writev t ?force ?src ~dst ~protocol sstr =
-  let ( let* ) = Result.bind in
-  let fn acc str = acc + String.length str in
-  let len = List.fold_left fn 0 sstr in
-  let* () = guard `Exceeds_MTU @@ fun () -> len <= t.mtu in
-  unsafe_write t ?force ?src ~dst ~protocol (Multiple sstr);
-  Ok ()
-
-let write_into t ?force ?src ~dst ~protocol fn =
-  unsafe_write t ?force ?src ~dst ~protocol (Into fn)
-
-let unsafe_writev t ?force ?src ~dst ~protocol sstr =
-  unsafe_write t ?force ?src ~dst ~protocol (Multiple sstr)
-
-let unsafe_write t ?force ?src ~dst ~protocol str =
-  unsafe_write t ?force ?src ~dst ~protocol (Simple str)
 
 type daemon = unit Miou.t
 

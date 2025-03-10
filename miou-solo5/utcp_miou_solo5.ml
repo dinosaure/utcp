@@ -123,7 +123,7 @@ module TCPv4 = struct
       let src = Ipaddr.V4 src
       and dst = Ipaddr.V4 dst in
       Utcp.Segment.encode_and_checksum_into (now ()) cs ~src ~dst seg in
-    let pkt = IPv4.Writer.into ~len (Seq.return fn) in
+    let pkt = IPv4.Writer.into ipv4 ~len fn in
     match IPv4.write ipv4 ~src dst IPv4.TCP pkt with
     | Ok () -> ()
     | Error `Route_not_found ->

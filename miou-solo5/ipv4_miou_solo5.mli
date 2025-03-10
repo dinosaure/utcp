@@ -33,7 +33,16 @@ module Writer : sig
 
   val of_string : ipv4 -> string -> t
   val of_strings : ipv4 -> string list -> t
-  val into : len:int -> (Bstr.t -> unit) Seq.t -> t
+  val into : ipv4 -> len:int -> (Bstr.t -> unit) -> t
+
+  type ('p, 'q, 'a) m
+  type z
+  type 'a s
+
+  val ( let* ) : ('p, 'q, 'a) m -> ('a -> ('q, 'r, 'b) m) -> ('p, 'r, 'b) m
+  val ( let+ ) : ('p s, 'q s, 'a) m -> (Bstr.t -> int) -> ('p, 'q s, 'a) m
+  val return : 'a -> ('p, 'p, 'a) m
+  val unknown : (z, 'n s, unit) m -> t
 end
 
 val write :

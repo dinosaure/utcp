@@ -295,27 +295,30 @@ type t =
   ; src : Logs.src }
 
 module Writer = struct
-  type zero = |
-  type 'a succ = |
+  type z = |
+  type 'a s = |
+
+  type 'a peano =
+    | Zero : z peano
+    | Succ : 'a peano -> 'a s peano
 
   [@@@warning "-27"]
   [@@@warning "-37"]
 
-  type packet =
-    { pseudo_header : Bstr.t
-    ; payload : Bstr.t }
-
   type ('p, 'q, 'a) m =
     | Bind : ('p, 'q, 'a) m * ('a -> ('q, 'r, 'b) m) -> ('p, 'r, 'b) m
-    | Return : 'a -> ('p, 'q, 'a) m
-    | Total_length : int * int -> ('p * 'n, 'p succ * 'n succ, packet) m
-    | Send : ('p succ * 'n, 'p * 'n, unit) m
+    | Return : 'a -> ('p, 'p, 'a) m
+    | Write : ('n s, 'm s, 'a) m * (Bstr.t -> int) -> ('n, 'm s, 'a) m
 
   type ipv4 = t
 
   type t =
-    | Fixed of { total_length : int; fn : (Bstr.t -> unit) Seq.t }
-    | Unknown : (zero * zero, zero * 'n succ, unit) m -> t
+    | Fixed of { total_length : int; fn : (Bstr.t -> unit) }
+      (* invariant: [total_length <= mtu - 20] *)
+    | Fragmented of { total_length : int; fn : (Bstr.t -> unit) Seq.t }
+      (* invariant: [bstr] is filled to [(mtu - 20) land (lnot 0b111)]
+         until the last element (which contains remaining unaligned bytes. *)
+    | Unknown : (z, 'n s, unit) m -> t
 
   let of_string t str =
     let mtu = Ethernet.mtu t.eth in
@@ -324,7 +327,7 @@ module Writer = struct
     then
       let len = total_length in
       let fn = Bstr.blit_from_string str ~src_off:0 ~dst_off:0 ~len in
-      Fixed { total_length; fn= Seq.return fn }
+      Fixed { total_length; fn }
     else
       let fragment = (mtu - 20) land (lnot 0b111) in
       let rec go src_off () =
@@ -333,7 +336,7 @@ module Writer = struct
           let len = Int.min (total_length - src_off) fragment in
           let fn = Bstr.blit_from_string str ~src_off ~dst_off:0 ~len in
           Seq.Cons (fn, go (src_off + len)) in
-      Fixed { total_length; fn= go 0 }
+      Fragmented { total_length; fn= go 0 }
 
   let chunk chunk_size ?(str_off= 0) sstr =
     let rec go acc str_off chunk_size sstr =
@@ -365,7 +368,7 @@ module Writer = struct
           Bstr.blit_from_string str ~src_off:0 bstr ~dst_off:!dst_off ~len;
           dst_off := !dst_off + len
         done in
-      Fixed { total_length; fn= Seq.return fn }
+      Fixed { total_length; fn }
     else
       let fragment = (mtu - 20) land (lnot 0b111) in
       let rec go (str_off, sstr) () = match sstr with
@@ -382,10 +385,43 @@ module Writer = struct
               done in
             Seq.Cons (fn, go (str_off, sstr)) in
       let fn = go (0, sstr) in
-      Fixed { total_length; fn }
+      Fragmented { total_length; fn }
 
-  let into ~len:total_length fn =
+  let into t ~len:total_length fn =
+    if 20 + total_length > Ethernet.mtu t.eth
+    then invalid_arg "IPv4.Writer.into: too huge IPv4 packet";
     Fixed { total_length; fn }
+
+  let unknown : type n. (z, n s, unit) m -> t = fun m -> Unknown m
+
+  type yield = last:bool -> (Bstr.t -> int) -> unit
+
+  let ( let* ) x fn = Bind (x, fn)
+  let ( let+ ) x fn = Write (x, fn)
+  let return x = Return x
+
+  type ('a, 'b) refl = Refl : ('a, 'a) refl
+
+  let rec refl : type a b. a peano -> b peano -> (a, b) refl option
+    = fun a b -> match a, b with
+      | Zero, Zero -> Some Refl
+      | Succ a, Succ b ->
+          begin match refl a b with
+          | Some Refl -> Some Refl
+          | None -> None end
+      | _ -> None
+
+  let rec go : type a p q. yield:yield -> p peano -> (p, q, a) m -> (q peano * a)
+    = fun ~yield s m -> match m, s with
+    | Return x, _ -> (s, x)
+    | Bind (m, fn), s ->
+        let s, x = go ~yield s m in
+        go ~yield s (fn x)
+    | Write (m, user's_fn), s ->
+        let s', r = go ~yield (Succ s) m in
+        match refl s' (Succ s) with
+        | Some Refl -> yield ~last:true user's_fn; s', r
+        | None -> yield ~last:false user's_fn; s', r
 end
 
 let guard err fn = if fn () then Ok () else Error err
@@ -432,18 +468,16 @@ let write t ?(ttl= 38) ?src dst protocol p =
       let src = Option.value ~default:(Ipaddr.V4.Prefix.address t.cidr) src in
       let mtu = Ethernet.mtu t.eth in
       match p with
-      | Writer.Fixed { total_length; fn; } when total_length <= mtu ->
+      | Writer.Fixed { total_length; fn= user's_fn; } ->
           let pkt =
             { Packet.src; dst; uid= 0; flags= Flag._none; off= 0; ttl
             ; protocol; checksum_and_length= Packet.Partial
             ; opt= Bstr.empty } in
           let protocol = Ethernet.IPv4 in
-          let write user's_fn =
-            let fn = fixed pkt user's_fn total_length in
-            Ethernet.write_into t.eth ~dst:macaddr ~protocol fn in
-          Seq.iter write fn;
+          let fn = fixed pkt user's_fn total_length in
+          Ethernet.write_into t.eth ~dst:macaddr ~protocol fn;
           Ok ()
-      | Writer.Fixed { total_length; fn; } ->
+      | Writer.Fragmented { total_length; fn; } ->
           let uid = Mirage_crypto_rng.generate 2 in
           let uid = String.get_uint16_be uid 0 in
           let rec go off total_length = function
@@ -459,11 +493,42 @@ let write t ?(ttl= 38) ?src dst protocol p =
                 let protocol = Ethernet.IPv4 in
                 let fn = fixed pkt user's_fn size in
                 Ethernet.write_into t.eth ~dst:macaddr ~protocol fn;
-                if next != Seq.Nil
+                if next != Seq.Nil && total_length - size > 0
                 then go (off + size) (total_length - size) next in
           go 0 total_length (fn ());
           Ok ()
-      | Unknown _ -> assert false
+      | Unknown m ->
+          let uid = Mirage_crypto_rng.generate 2 in
+          let uid = String.get_uint16_be uid 0 in
+          let off = ref 0 in
+          let seq =
+            let module M = struct
+              type _ Effect.t += Yield : { last : bool; user's_fn : (Bstr.t -> int) } -> unit Effect.t
+            end in
+            let yield ~last user's_fn = Effect.perform (M.Yield { last; user's_fn }) in
+            fun () -> match Writer.go ~yield Writer.Zero m with
+            | Succ _, () -> Seq.Nil
+            | effect M.Yield { last; user's_fn }, k ->
+                Seq.Cons ((last, user's_fn), Effect.Deep.continue k) in
+          let fn (last, user's_fn) =
+            let fn bstr =
+              let flags = if last then Flag._none else Flag._mf in
+              let pkt =
+                { Packet.src; dst; uid; flags; off= !off lsr 3; ttl
+                ; protocol ; checksum_and_length= Packet.Partial
+                ; opt= Bstr.empty } in
+              Packet.encode_into pkt bstr;
+              let len = user's_fn (Bstr.sub bstr ~off:20 ~len:(Bstr.length bstr - 20)) in
+              Bstr.set_uint16_be bstr 2 (20 + len);
+              let len = (len + 0b111) / 8 * 8 in
+              off := !off + len;
+              let chk = Utcp.Checksum.digest ~off:0 ~len:20 bstr in
+              Bstr.set_uint16_be bstr 10 chk;
+              20 + len in
+            let protocol = Ethernet.IPv4 in
+            Ethernet.write_into t.eth ~dst:macaddr ~protocol fn in
+          Seq.iter fn seq;
+          Ok ()
 
 let input t pkt =
   match Packet.decode pkt.Ethernet.payload with
