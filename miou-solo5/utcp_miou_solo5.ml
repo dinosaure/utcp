@@ -7,6 +7,72 @@ exception Net_unreach
 exception Closed_by_peer
 exception Connection_refused
 
+module Buffer = struct
+  type t =
+    { mutable bstr : Bstr.t
+    ; mutable off : int
+    ; mutable len : int }
+
+  let create size =
+    let bstr = Bstr.create size in
+    { bstr; off= 0; len= 0 }
+
+  let available { bstr; off; len; } =
+    Bstr.length bstr - off - len
+
+  let compress t =
+    if t.len == 0 then begin
+      t.off <- 0;
+      t.len <- 0
+    end else if t.off > 0 then begin
+      Bstr.blit t.bstr ~src_off:t.off t.bstr ~dst_off:0 ~len:t.len;
+      t.off <- 0;
+    end
+
+  let get t ~fn =
+    let n = fn t.bstr ~off:t.off ~len:t.len in
+    t.off <- t.off + n;
+    t.len <- t.len - n;
+    if t.len == 0 then t.off <- 0;
+    n
+
+  let put t ~fn =
+    compress t;
+    let off = t.off + t.len in
+    let bstr = t.bstr in
+    if Bstr.length bstr == t.len then begin
+      t.bstr <- Bstr.create (2 * Bstr.length bstr);
+      Bstr.blit bstr ~src_off:t.off t.bstr ~dst_off:0 ~len:t.len
+    end;
+    let n = fn t.bstr ~off ~len:(Bstr.length t.bstr - off) in
+    t.len <- t.len + n;
+    n
+end
+
+module Notify = struct
+  type 'a t =
+    { queue : 'a Queue.t
+    ; mutex : Miou.Mutex.t
+    ; condition : Miou.Condition.t }
+
+  let create () =
+    { queue= Queue.create ()
+    ; mutex= Miou.Mutex.create ()
+    ; condition= Miou.Condition.create () }
+
+  let signal value t =
+    Miou.Mutex.protect t.mutex @@ fun () ->
+    Queue.push value t.queue;
+    Miou.Condition.signal t.condition
+
+  let await t =
+    Miou.Mutex.protect t.mutex @@ fun () ->
+    while Queue.is_empty t.queue do
+      Miou.Condition.wait t.condition t.mutex
+    done;
+    Queue.pop t.queue
+end
+
 (* NOTE(dinosaure): μTCP is actually well-abstracted about IPv4 and IPv6 but we
    only have IPv4 implementation. We should handle easily the IPv6 at this
    layer I think. *)
@@ -15,7 +81,7 @@ module TCPv4 = struct
   
   module Log = (val Logs.src_log src : Logs.LOG)
 
-  type w = (unit, [ `Eof | `Msg of string ]) result Miou.Computation.t
+  type w = (unit, [ `Eof | `Msg of string ]) result Notify.t
 
   type state =
     { mutable tcp : w Utcp.state
@@ -23,12 +89,23 @@ module TCPv4 = struct
     ; queue : Utcp.output Queue.t
     ; mutex : Miou.Mutex.t
     ; condition : Miou.Condition.t
-    ; orphans : unit Miou.orphans }
+    ; orphans : unit Miou.orphans
+    ; accept : (int, accept) Hashtbl.t }
 
-  type flow =
+  and accept =
+    | Await of flow Miou.Computation.t
+    | Pending of flow Queue.t
+
+  and flow =
     { state : state
     ; src : Logs.src
-    ; flow : Utcp.flow }
+    ; flow : Utcp.flow
+    ; buffer : Buffer.t
+    ; mutable closed : bool }
+
+  let pp_accept ppf = function
+    | Await _ -> Fmt.string ppf "await"
+    | Pending q -> Fmt.pf ppf "pending(%d)" (Queue.length q)
 
   let[@inline] now () =
     let n = Miou_solo5.clock_monotonic () in
@@ -59,24 +136,40 @@ module TCPv4 = struct
     | _ -> failwith "IPv6 not implemented"
 
   type result =
-    | Data of string
+    | Filled
     | Eof
     | Refused
 
-  let read t =
+  let fill t data =
+    let rec go data =
+      let { Cstruct.buffer; off; len } = data in
+      if len > 0 then begin
+        let len = Int.min len (Buffer.available t.buffer) in
+        let fn dst ~off:dst_off ~len:_ =
+          Bstr.blit buffer ~src_off:off dst ~dst_off ~len; len in
+        let _ = Buffer.put t.buffer ~fn in
+        go (Cstruct.shift data len)
+      end in
+    go data; Filled
+
+  let read_into t =
     match Utcp.recv t.state.tcp (now ()) t.flow with
     | Ok (tcp, data, c, segs) ->
         t.state.tcp <- tcp;
         List.iter (write_ip t.state.ipv4) segs;
+        Logs.debug ~src:t.src (fun m -> m "recv new packet (%d byte(s))"
+          (Cstruct.length data));
         if Cstruct.length data == 0
-        then match Miou.Computation.await_exn c with
+        then match Notify.await c with
         | Ok () ->
             begin match Utcp.recv t.state.tcp (now ()) t.flow with
             | Ok (tcp, data, _c, segs) ->
                 (* TODO(dinosaure): assert (c == _c)? *)
                 t.state.tcp <- tcp;
                 List.iter (write_ip t.state.ipv4) segs;
-                Data (Cstruct.to_string data)
+                Logs.debug ~src:t.src (fun m -> m "recv new packet (%d byte(s)) (second)"
+                  (Cstruct.length data));
+                fill t data
             | Error `Eof -> Eof
             | Error (`Msg msg) ->
                 Logs.err ~src:t.src (fun m -> m "%a error while read (second recv): %s"
@@ -87,12 +180,31 @@ module TCPv4 = struct
             Logs.err ~src:t.src (fun m -> m "%a error from computation while recv: %s"
               Utcp.pp_flow t.flow msg);
             Refused
-        else Data (Cstruct.to_string data)
+        else fill t data
     | Error `Eof -> Eof
     | Error (`Msg msg) ->
         Logs.err ~src:t.src (fun m -> m "%a error while read: %s"
           Utcp.pp_flow t.flow msg);
         Refused
+
+  let read t ?off:(dst_off= 0) ?len buf =
+    if t.closed then 0
+    else
+      let len = match len with
+        | Some len -> len
+        | None -> Bytes.length buf - dst_off in
+      match read_into t with
+      | Filled ->
+          let fn bstr ~off:src_off ~len:src_len =
+            let len = Int.min src_len len in
+            Bstr.blit_to_bytes bstr ~src_off buf ~dst_off ~len; len in
+          Buffer.get t.buffer ~fn
+      | Eof ->
+          Logs.debug ~src:t.src (fun m -> m "End-of-transmision received");
+          0
+      | Refused ->
+          Logs.err ~src:t.src (fun m -> m "Connection refused");
+          t.closed <- true; 0
 
   (* NOTE(dinosaure): μTCP takes the ownership on [cs], so we can not use a
      internal buffer associated to our flow to avoid allocation-per-writing. The
@@ -109,7 +221,7 @@ module TCPv4 = struct
         List.iter (write_ip t.state.ipv4) segs;
         if bytes_sent < Cstruct.length cs
         then
-          let result = Miou.Computation.await_exn c in
+          let result = Notify.await c in
           match result with
           | Error `Eof -> raise Closed_by_peer
           | Error (`Msg msg) ->
@@ -118,23 +230,30 @@ module TCPv4 = struct
               raise Closed_by_peer
           | Ok () -> write t (Cstruct.shift cs bytes_sent)
 
-  let write t str = write t (Cstruct.of_string str)
+  let write t ?(off= 0) ?len str =
+    let len = match len with
+      | Some len -> len
+      | None -> String.length str - off in
+    write t (Cstruct.of_string ~off ~len str)
 
   let close t =
+    if t.closed then Fmt.invalid_arg "Connection already closed";
     match Utcp.close t.state.tcp (now ()) t.flow with
     | Ok (tcp, segs) ->
         t.state.tcp <- tcp;
-        List.iter (write_ip t.state.ipv4) segs
+        List.iter (write_ip t.state.ipv4) segs;
+        t.closed <- true
     | Error (`Msg msg) ->
         Logs.err ~src:t.src (fun m -> m "%a error in close: %s"
           Utcp.pp_flow t.flow msg)
 
-  let eof = Error `Eof
-  let ok = Ok ()
-  let eof c = ignore (Miou.Computation.try_return c eof)
-  let ok c = ignore (Miou.Computation.try_return c ok)
+  let peers { flow; _ } = Utcp.peers flow
+
+  let _eof = Error `Eof
+  let _ok = Ok ()
 
   let handler state (pkt, payload) =
+    Log.debug (fun m -> m "New TCPv4 packet");
     let src = Ipaddr.V4 pkt.IPv4.src in
     let dst = Ipaddr.V4 pkt.IPv4.dst in
     (* NOTE(dinosaure): μTCP takes the ownership on [cs] also. We can try to
@@ -155,20 +274,40 @@ module TCPv4 = struct
     state.tcp <- tcp;
     let none = ()
     and some = function
-      | `Established (flow, c) ->
+      | `Established (flow, None) ->
+          let (_, src_port), (ipaddr, port) = Utcp.peers flow in
+          Log.debug (fun m -> m "established connection with %a:%d"
+            Ipaddr.pp ipaddr port);
+          let src = Logs.Src.create (Fmt.str "%a:%d" Ipaddr.pp ipaddr port) in
+          let buffer = Buffer.create 0x7ff in
+          let flow = { state; src; flow; buffer; closed= false } in
+          begin match Hashtbl.find state.accept src_port with
+          | Await c ->
+              Hashtbl.remove state.accept src_port;
+              Log.debug (fun m -> m "transmit the new incoming TCPv4 connection");
+              Log.debug (fun m -> m "@[<hov>%a@]"
+                Fmt.(Dump.hashtbl int pp_accept) state.accept);
+              ignore (Miou.Computation.try_return c flow)
+          | Pending q -> Queue.push flow q
+          | exception Not_found ->
+              let q = Queue.create () in
+              Queue.push flow q;
+              Hashtbl.add state.accept src_port (Pending q) end
+      | `Established (flow, Some c) ->
           Log.debug (fun m -> m "connection established (%a)" Utcp.pp_flow flow);
-          Option.iter ok c
+          Notify.signal _ok c
       | `Drop (flow, c, cs) ->
           Log.debug (fun m -> m "drop (%a)" Utcp.pp_flow flow);
-          List.iter eof cs;
-          Option.iter ok c
+          List.iter (Notify.signal _eof) cs;
+          Option.iter (Notify.signal _ok) c
       | `Signal (flow, cs) ->
           Log.debug (fun m -> m "signal (%a)" Utcp.pp_flow flow);
-          List.iter ok cs in
+          List.iter (Notify.signal _ok) cs in
     Option.fold ~none ~some ev;
-    Miou.Mutex.protect state.mutex @@ fun () ->
     List.iter (fun out -> Queue.push out state.queue) segs;
-    Miou.Condition.signal state.condition
+    if List.length segs > 0
+    then Miou.Mutex.protect state.mutex @@ fun () ->
+      Miou.Condition.signal state.condition
 
   let rec transfer state acc = match Queue.pop state.queue with
     | exception Queue.Empty -> acc
@@ -203,21 +342,12 @@ module TCPv4 = struct
               (Printexc.to_string exn));
             clean orphans
 
-  let rec daemon state user's_outs n =
+  let rec daemon state n =
     clean state.orphans;
+    let user's_outs = write_or_sync state in
     let tcp, drops, outs = Utcp.timer state.tcp (now ()) in
     state.tcp <- tcp;
     let outs = List.rev_append user's_outs outs in
-    let fn (_id, err, rcv, snd) =
-      let err = match err with
-        | `Retransmission_exceeded -> `Msg "retransmission exceeded"
-        | `Timer_2msl -> `Eof
-        | `Timer_connection_established -> `Eof
-        | `Timer_fin_wait_2 -> `Eof in
-      let err = Error err in
-      ignore (Miou.Computation.try_return rcv err);
-      ignore (Miou.Computation.try_return snd err) in
-    List.iter fn drops;
     let fn out = ignore (Miou.async ~orphans:state.orphans @@ fun () ->
       try write_ip state.ipv4 out
       with
@@ -229,16 +359,52 @@ module TCPv4 = struct
         Log.err (fun m -> m "Unexpected exception (%a -> %a): %s"
           Ipaddr.pp src Ipaddr.pp dst (Printexc.to_string exn))) in
     List.iter fn outs;
-    let user's_outs = write_or_sync state in
-    daemon state user's_outs (n+1)
+    let fn (_id, err, rcv, snd) =
+      let err = match err with
+        | `Retransmission_exceeded -> `Msg "retransmission exceeded"
+        | `Timer_2msl -> `Eof
+        | `Timer_connection_established -> `Eof
+        | `Timer_fin_wait_2 -> `Eof in
+      let err = Error err in
+      Notify.signal err rcv;
+      Notify.signal err snd in
+    List.iter fn drops;
+    daemon state (n+1)
+
+  type listen = Listen of int [@@unboxed]
+
+  let accept state (Listen port) =
+    match Hashtbl.find state.accept port with
+    | exception Not_found ->
+        let c = Miou.Computation.create () in
+        Hashtbl.add state.accept port (Await c);
+        Miou.Computation.await_exn c
+    | Await c ->
+        Log.debug (fun m -> m "listen on %a:%d: multiple waiters"
+          Ipaddr.V4.pp (IPv4.src state.ipv4) port);
+        Miou.Computation.await_exn c
+    | Pending q -> match Queue.pop q with
+      | exception Queue.Empty ->
+          let c = Miou.Computation.create () in
+          Hashtbl.replace state.accept port (Await c);
+          Miou.Computation.await_exn c
+      | flow -> flow
+
+  let listen state port =
+    let tcp = Utcp.start_listen state.tcp port in
+    state.tcp <- tcp;
+    Listen port
+
+  type daemon = unit Miou.t
 
   let create ~name ipv4 =
-    let tcp = Utcp.empty Miou.Computation.create name Mirage_crypto_rng.generate in
+    let tcp = Utcp.empty Notify.create name Mirage_crypto_rng.generate in
     let mutex = Miou.Mutex.create () in
     let condition = Miou.Condition.create () in
     let orphans = Miou.orphans () in
-    let state = { tcp; ipv4; queue= Queue.create (); mutex; condition; orphans } in
-    let prm = Miou.async (fun () -> daemon state [] 0) in
+    let accept = Hashtbl.create 0x10 in
+    let state = { tcp; ipv4; queue= Queue.create (); mutex; condition; orphans; accept } in
+    let prm = Miou.async (fun () -> daemon state 0) in
     prm, state
 
   let kill = Miou.cancel
@@ -251,8 +417,10 @@ module TCPv4 = struct
     state.tcp <- tcp;
     write_ip state.ipv4 seg;
     Logs.debug ~src (fun m -> m "Waiting for a TCP handshake");
-    match Miou.Computation.await_exn c with
-    | Ok () -> { state; flow; src }
+    match Notify.await c with
+    | Ok () ->
+        let buffer = Buffer.create 0x7ff in
+        { state; flow; src; buffer; closed= false }
     | Error `Eof ->
         Logs.err ~src (fun m -> m "%a error established connection (timeout)" Utcp.pp_flow flow);
         raise Connection_refused
