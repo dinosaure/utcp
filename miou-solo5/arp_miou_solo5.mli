@@ -25,5 +25,5 @@ val query : t -> Ipaddr.V4.t -> (Macaddr.t, [> error ]) result
 
 (** ARPv4 daemon *)
 
-val transfer : t -> Bstr.t Ethernet.packet -> unit
+val transfer : t -> Slice_bstr.t Ethernet.packet -> unit
 val kill : daemon -> unit

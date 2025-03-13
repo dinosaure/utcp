@@ -11,6 +11,7 @@ module Packet = struct
     ; dst : Macaddr.t
     ; protocol : protocol option }
 
+  (*
   open Bin
 
   let macaddr = map (bytes 6) Macaddr.of_octets_exn Macaddr.to_octets
@@ -36,22 +37,39 @@ module Packet = struct
     |+ field macaddr (fun t -> t.src)
     |+ field protocol (fun t -> t.protocol)
     |> sealr
+  *)
+
+  let guard err fn = if fn () then Ok () else Error err
+
+  let protocol_of_int = function
+    | 0x0806 -> Some ARPv4
+    | 0x0800 -> Some IPv4
+    | 0x86dd -> Some IPv6
+    | _ -> None
+
+  let protocol_to_int = function
+    | ARPv4 -> 0x0806
+    | IPv4 -> 0x0800
+    | IPv6 -> 0x86dd
 
   let decode bstr =
-    try
-      let off = ref 0 in
-      let pkt = decode_bstr t bstr off in
-      let payload = Bstr.shift bstr !off in
-      Ok (pkt, payload)
-    with _exn -> Error `Invalid_ethernet_packet
+    let ( let* ) = Result.bind in
+    let* () = guard `Invalid_ethernet_packet @@ fun () ->
+      Bstr.length bstr >= 14 in
+    let dst = Macaddr.of_octets_exn (Bstr.sub_string bstr ~off:0 ~len:6) in
+    let src = Macaddr.of_octets_exn (Bstr.sub_string bstr ~off:6 ~len:6) in
+    let protocol = Bstr.get_uint16_be bstr 12 in
+    let protocol = protocol_of_int protocol in
+    let payload = Slice_bstr.make ~off:14 bstr in
+    Ok ({ src; dst; protocol }, payload)
 
-  let encode_into ?(off= 0) pkt bstr =
-    try
-      let off = ref off in
-      encode_bstr t pkt bstr off
-    with exn ->
-      Fmt.failwith "Impossible to encode ethernet packet: %s"
-        (Printexc.to_string exn)
+  let encode_into t ?(off= 0) bstr = match t.protocol with
+    | None -> Fmt.invalid_arg "Ethernet.Packet.encode_into: you must specify a protocol"
+    | Some protocol ->
+        let protocol = protocol_to_int protocol in
+        Bstr.blit_from_string (Macaddr.to_octets t.dst) ~src_off:0 bstr ~dst_off:(off + 0) ~len:6;
+        Bstr.blit_from_string (Macaddr.to_octets t.src) ~src_off:0 bstr ~dst_off:(off + 6) ~len:6;
+        Bstr.set_uint16_be bstr 12 protocol
 end
 
 type protocol = Packet.protocol =
@@ -75,7 +93,7 @@ and 'a packet =
   ; dst : Macaddr.t
   ; protocol : Packet.protocol
   ; payload : 'a }
-and handler = Bstr.t packet -> unit
+and handler = Slice_bstr.t packet -> unit
 
 let mac { mac; _ } = mac
 
@@ -100,7 +118,7 @@ let write_into t (packet : (Bstr.t -> int) packet) =
   let fn = packet.payload in
   let src = Option.value ~default:t.mac packet.src in
   let pkt = { Packet.src; dst= packet.dst; protocol= Some packet.protocol } in
-  Packet.encode_into ~off:0 pkt t.bstr_oc;
+  Packet.encode_into pkt ~off:0 t.bstr_oc;
   let bstr = Bstr.sub t.bstr_oc ~off:14 ~len:(Bstr.length t.bstr_oc - 14) in
   let plus = fn bstr in
   Logs.debug ~src:t.src (fun m -> m "write ethernet packet src:%a -> dst:%a"
@@ -119,7 +137,8 @@ let rec daemon t =
        match protocol with
        | None -> ()
        | Some protocol ->
-         let packet = { src= Some src; dst; protocol; payload } in
+         let packet =
+           { src= Some src; dst; protocol; payload } in
          if Macaddr.compare dst t.mac == 0
          || Macaddr.is_unicast dst == false
          then
@@ -128,7 +147,7 @@ let rec daemon t =
              Logs.err ~src:t.src (fun m -> m "Unexpected exception from the user's handler: %s"
                (Printexc.to_string exn));
          else begin
-           let payload = Bstr.to_string payload in
+           let payload = Slice_bstr.to_string payload in
            Logs.debug ~src:t.src (fun m -> m "Ignore (%a -> %a):" Macaddr.pp src Macaddr.pp dst);
            Logs.debug ~src:t.src (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) payload);
          end in

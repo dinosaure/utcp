@@ -2,6 +2,8 @@ module Ethernet = Ethernet_miou_solo5
 
 [@@@warning "-37"]
 
+let error_msgf fmt = Fmt.kstr (fun msg -> Error (`Msg msg)) fmt
+
 module Packet = struct
   type t =
     { operation : operation
@@ -12,6 +14,16 @@ module Packet = struct
   and operation =
     | Request | Reply
 
+  let operation_of_int = function
+    | 1 -> Ok Request
+    | 2 -> Ok Reply
+    | n -> error_msgf "Invalid ARPv4 operation (%02x)" n
+
+  let operation_to_int = function
+    | Request -> 1
+    | Reply -> 2
+
+  (*
   open Bin
 
   let ipaddr = map beint32 Ipaddr.V4.of_int32 Ipaddr.V4.to_int32
@@ -41,10 +53,34 @@ module Packet = struct
     |+ field macaddr (fun t -> t.dst_mac)
     |+ field ipaddr (fun t -> t.dst_ip)
     |> sealr
+  *)
+
+  let guard err fn = if fn () then Ok () else Error err
 
   let decode ?(off= 0) str =
-    try Ok (decode t str (ref off))
-    with _exn -> Error `Invalid_ARPv4_packet
+    let ( let* ) = Result.bind in
+    let* () = guard `Invalid_ARPv4_packet @@ fun () -> String.length str - off >= 28 in
+    let operation = String.get_uint16_be str (off + 6) in
+    let* operation = operation_of_int operation in
+    let src_mac = Macaddr.of_octets_exn (String.sub str (off + 8) 6) in
+    let src_ip = Ipaddr.V4.of_int32 (String.get_int32_be str (off + 14)) in
+    let dst_mac = Macaddr.of_octets_exn (String.sub str (off + 18) 6) in
+    let dst_ip = Ipaddr.V4.of_int32 (String.get_int32_be str (off + 24)) in
+    Ok { operation; src_mac; dst_mac; src_ip; dst_ip }
+
+  let unsafe_encode_into t ?(off= 0) bstr =
+    Bstr.set_uint16_be bstr (off + 0) 1;
+    Bstr.set_uint16_be bstr (off + 2) 0x0800;
+    Bstr.set_uint8 bstr (off + 4) 6;
+    Bstr.set_uint8 bstr (off + 5) 4;
+    Bstr.set_uint16_be bstr (off + 6) (operation_to_int t.operation);
+    let src_mac = Macaddr.to_octets t.src_mac in
+    Bstr.blit_from_string src_mac ~src_off:0 bstr ~dst_off:(off + 8) ~len:6;
+    Bstr.set_int32_be bstr (off + 14) (Ipaddr.V4.to_int32 t.src_ip);
+    let dst_mac = Macaddr.to_octets t.dst_mac in
+    Bstr.blit_from_string dst_mac ~src_off:0 bstr ~dst_off:(off + 18) ~len:6;
+    Bstr.set_int32_be bstr (off + 24) (Ipaddr.V4.to_int32 t.dst_ip);
+    28
 end
 
 let mac0 = Macaddr.of_octets_exn (String.make 6 '\000')
@@ -84,7 +120,9 @@ let alias t ipaddr =
   (pkt, Macaddr.broadcast)
 
 let write t (arp, dst) =
-  let fn bstr = Bin.encode_bstr Packet.t arp bstr (ref 0); 28 in
+  (* NOTE(dinosaure): we already check, in [create] that the MTU is more than
+     [28] bytes. The buffer given by [Ethernet] is also more than [28] bytes. *)
+  let fn = Packet.unsafe_encode_into arp ~off:0 in
   Ethernet.write_into t.eth ~dst ~protocol:Ethernet.ARPv4 fn
 
 let guard err fn = if fn () then Ok () else Error err
@@ -305,7 +343,7 @@ let create ?(delay= 1_500_000_000) ?(timeout= 800) ?(retries= 5) ?src ?ipaddr et
   Ok (prm, t)
 
 let transfer t pkt =
-  let payload = Bstr.sub_string pkt.Ethernet.payload ~off:0 ~len:28 in
+  let payload = Slice_bstr.sub_string pkt.Ethernet.payload ~off:0 ~len:28 in
   let pkt = { pkt with Ethernet.payload } in
   Miou.Mutex.protect t.mutex @@ fun () ->
   Queue.push pkt t.queue;

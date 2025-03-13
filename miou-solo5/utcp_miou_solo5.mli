@@ -18,6 +18,7 @@ module TCPv4 : sig
 
   val connect : state -> (Ipaddr.V4.t * int) -> flow
   val read : flow -> ?off:int -> ?len:int -> bytes -> int
+  val really_read : flow -> ?off:int -> ?len:int -> bytes -> unit
   val write : flow -> ?off:int -> ?len:int -> string -> unit
   val close : flow -> unit
   val peers : flow -> (Ipaddr.t * int) * (Ipaddr.t * int)

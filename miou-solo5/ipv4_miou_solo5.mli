@@ -11,7 +11,7 @@ type packet =
 
 and protocol = ICMP | TCP | UDP
 and payload =
-  | Bstr of Bstr.t
+  | Slice of Slice_bstr.t
   | String of string
 
 val create :
@@ -62,5 +62,5 @@ val write :
     header of the layer above IPv4. The size of this header must be known in
     advance via the [size] argument. *)
 
-val input : t -> Bstr.t Ethernet.packet -> unit
+val input : t -> Slice_bstr.t Ethernet.packet -> unit
 val set_handler : t -> ((packet * payload) list -> unit) -> unit

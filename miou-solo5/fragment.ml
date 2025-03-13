@@ -14,7 +14,7 @@ and unfragmented = |
 type 'a payload =
   | Unsized : Ropes.unknown Ropes.t -> fragmented payload
   | Sized : Diet.t * bytes -> fragmented payload
-  | Unfragmented : Bstr.t -> unfragmented payload
+  | Unfragmented : Slice_bstr.t -> unfragmented payload
 
 type t = Payload : 'a payload -> t [@@unboxed]
 (* A payload can be:
@@ -54,14 +54,20 @@ type t = Payload : 'a payload -> t [@@unboxed]
    Solo5 up to here, this unfragmented packet **is not** a copy.
 *)
 
-let singleton ~off ?(limit= false) str : t =
-  let empty = Ropes.(Unknown Limitless) in
-  let ropes = Ropes.insert ~off str empty in
-  match limit with
-  | false ->
+let singleton ~off ?(limit= false) slice : t =
+  match off, limit with
+  | _, false ->
+    let str = Slice_bstr.to_string slice in
+    let empty = Ropes.(Unknown Limitless) in
+    let ropes = Ropes.insert ~off str empty in
     Log.debug (fun m -> m "+%d byte(s) %@ %d" (String.length str) off);
     Payload (Unsized ropes)
-  | true ->
+  | 0, true ->
+    Payload (Unfragmented slice)
+  | _, true ->
+    let str = Slice_bstr.to_string slice in
+    let empty = Ropes.(Unknown Limitless) in
+    let ropes = Ropes.insert ~off str empty in
     let max = off + String.length str in
     Log.debug (fun m -> m "+%d byte(s) %@ %d (max: %d)" (String.length str) off max);
     let ropes = Ropes.fix ~max ropes in

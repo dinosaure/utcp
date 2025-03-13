@@ -206,6 +206,18 @@ module TCPv4 = struct
           Logs.err ~src:t.src (fun m -> m "Connection refused");
           t.closed <- true; 0
 
+  let rec really_read t off len buf =
+    let len' = read t ~off ~len buf in
+    if len' == 0 then raise End_of_file
+    else if len - len' > 0 then
+      really_read t (off + len') (len - len') buf
+
+  let really_read t ?(off= 0) ?len buf =
+    let len = match len with None -> Bytes.length buf - off | Some len -> len in
+    if off < 0 || len < 0 || off > Bytes.length buf - len
+    then invalid_arg "TCPv4.really_read";
+    if len > 0 then really_read t off len buf
+
   (* NOTE(dinosaure): μTCP takes the ownership on [cs], so we can not use a
      internal buffer associated to our flow to avoid allocation-per-writing. The
      only viable solution seems to modify μTCP to use strings instead of
@@ -217,6 +229,7 @@ module TCPv4 = struct
           Utcp.pp_flow t.flow msg);
         raise Closed_by_peer
     | Ok (tcp, bytes_sent, c, segs) ->
+        Logs.debug ~src:t.src (fun m -> m "write %d byte(s)" bytes_sent);
         t.state.tcp <- tcp;
         List.iter (write_ip t.state.ipv4) segs;
         if bytes_sent < Cstruct.length cs
@@ -228,7 +241,10 @@ module TCPv4 = struct
               Logs.err ~src:t.src (fun m -> m "%a error from condition while sending: %s"
                 Utcp.pp_flow t.flow msg);
               raise Closed_by_peer
-          | Ok () -> write t (Cstruct.shift cs bytes_sent)
+          | Ok () ->
+              let cs = Cstruct.shift cs bytes_sent in
+              if Cstruct.length cs > 0 then write t (Cstruct.shift cs bytes_sent)
+              else Logs.debug ~src:t.src (fun m -> m "fully write the given string to peer")
 
   let write t ?(off= 0) ?len str =
     let len = match len with
@@ -253,9 +269,9 @@ module TCPv4 = struct
   let _ok = Ok ()
 
   let handler state (pkt, payload) =
-    Log.debug (fun m -> m "New TCPv4 packet");
     let src = Ipaddr.V4 pkt.IPv4.src in
     let dst = Ipaddr.V4 pkt.IPv4.dst in
+    Log.debug (fun m -> m "New TCPv4 packet (%a -> %a)" Ipaddr.pp src Ipaddr.pp dst);
     (* NOTE(dinosaure): μTCP takes the ownership on [cs] also. We can try to
        think, a bit deeply, about a zero-copy which includes the TCP layer if
        the given packet is not a part of a _segment_ but it requires some work
@@ -268,7 +284,10 @@ module TCPv4 = struct
        want to improve is the TCP/IP stack. ARPv4 & ICMPv4 are just side
        protocols. *)
     let cs = match payload with
-      | IPv4.Bstr bstr -> Cstruct.of_bigarray (Bstr.copy bstr)
+      | IPv4.Slice slice ->
+          let { Slice.buf; off; len; } = slice in
+          let bstr = Bstr.copy buf in
+          Cstruct.of_bigarray ~off ~len bstr
       | IPv4.String str -> Cstruct.of_string str in
     let tcp, ev, segs = Utcp.handle_buf state.tcp (now ()) ~src ~dst cs in
     state.tcp <- tcp;
@@ -284,9 +303,7 @@ module TCPv4 = struct
           begin match Hashtbl.find state.accept src_port with
           | Await c ->
               Hashtbl.remove state.accept src_port;
-              Log.debug (fun m -> m "transmit the new incoming TCPv4 connection");
-              Log.debug (fun m -> m "@[<hov>%a@]"
-                Fmt.(Dump.hashtbl int pp_accept) state.accept);
+              Log.debug (fun m -> m "transmit the new incoming TCPv4 connection to the handler");
               ignore (Miou.Computation.try_return c flow)
           | Pending q -> Queue.push flow q
           | exception Not_found ->
@@ -301,7 +318,7 @@ module TCPv4 = struct
           List.iter (Notify.signal _eof) cs;
           Option.iter (Notify.signal _ok) c
       | `Signal (flow, cs) ->
-          Log.debug (fun m -> m "signal (%a)" Utcp.pp_flow flow);
+          Log.debug (fun m -> m "signal (%a)(%d)" Utcp.pp_flow flow (List.length cs));
           List.iter (Notify.signal _ok) cs in
     Option.fold ~none ~some ev;
     List.iter (fun out -> Queue.push out state.queue) segs;

@@ -1,6 +1,9 @@
 let src = Logs.Src.create "ipv4-miou-solo5"
 
 module Log = (val Logs.src_log src : Logs.LOG)
+module SBstr = Slice_bstr
+
+let error_msgf fmt = Fmt.kstr (fun msg -> Error (`Msg msg)) fmt
 
 module Flag = struct
   type t = DF | MF
@@ -10,13 +13,13 @@ module Flag = struct
   let _mf = [ MF ]
   let _none = []
 
-  let to_flags cmd =  match cmd land 0b11 with
+  let of_int cmd =  match cmd land 0b11 with
     | 0b11 -> _dfmf
     | 0b10 -> _df
     | 0b01 -> _mf
     | _ -> _none
 
-  let of_flags flags =
+  let to_int flags =
     let cmd = ref 0 in
     let fn = function
       | DF -> cmd := !cmd lor 0b10
@@ -37,12 +40,26 @@ module Packet = struct
     ; ttl : int
     ; protocol : protocol
     ; checksum_and_length : 'a
-    ; opt : Bstr.t }
-  and protocol = ICMP | TCP | UDP | Unknown
-  and 'a status =
-    | P : partial status
-    | C : complete status
+    ; opt : Slice_bstr.t }
+  and protocol = ICMP | TCP | UDP
 
+  let protocol_of_int = function
+    | 1 -> Ok ICMP
+    | 6 -> Ok TCP
+    | 17 -> Ok UDP
+    | n -> error_msgf "Invalid IPv4 protocol (%02x)" n
+
+  let protocol_to_int = function
+    | ICMP -> 1
+    | TCP -> 6
+    | UDP -> 17
+
+  let pp_error ppf = function
+    | `Invalid_IPv4_packet -> Fmt.string ppf "bad packet"
+    | `Invalid_checksum -> Fmt.string ppf "bad checksum"
+    | `Msg msg -> Fmt.string ppf msg
+
+  (*
   open Bin
 
   let protocol =
@@ -114,35 +131,57 @@ module Packet = struct
 
   let complete_and_without_options = t ~ihl:5 C
   let partial_and_without_options = t ~ihl:5 P
+  *)
 
-  let decode ?(off= 0) bstr =
-    let version_and_ihl = Bstr.get_uint8 bstr off in
-    match version_and_ihl land 0b1111 with
-    | 5 ->
-        let pos = off in
-        let off = ref off in
-        let pkt = decode_bstr complete_and_without_options bstr off in
-        (* TODO(dinosaure): not sure if we just need to compute the checksum
-           and compare it with [0x0000] or set the checksum field to [0],
-           compute it and compare with what we expect. *)
-        Bstr.set_uint16_be bstr (pos + 10) 0;
-        let chk = Utcp.Checksum.digest ~off:pos ~len:(!off - pos) bstr in
-        if pkt.checksum_and_length.checksum != chk
-        then invalid_arg "Invalid IPv4 checksum";
-        let payload = Bstr.shift bstr !off in
-        pkt, payload
-    | ihl ->
-        let off = ref off in
-        let pkt = decode_bstr (t ~ihl C) bstr off in
-        let payload = Bstr.shift bstr !off in
-        pkt, payload
+  let guard err fn = if fn () then Ok () else Error err
 
-  let decode ?off bstr =
-    try Ok (decode ?off bstr)
-    with _ -> Error `Invalid_IPv4_packet
+  let decode slice =
+    let ( let* ) = Result.bind in
+    let version_and_ihl = SBstr.get_uint8 slice 0 in
+    let ihl = version_and_ihl land 0b1111 in
+    let* () = guard `Invalid_IPv4_packet @@ fun () ->
+      SBstr.length slice >= 20 in
+    let length = SBstr.get_uint16_be slice 2 in
+    let uid = SBstr.get_uint16_be slice 4 in
+    let flags_and_off = SBstr.get_uint16_be slice 6 in
+    let flags = Flag.of_int (flags_and_off lsr 13) in
+    let off = flags_and_off land 0x1fff in
+    let ttl = SBstr.get_uint8 slice 8 in
+    let protocol = SBstr.get_uint8 slice 9 in
+    let* protocol = protocol_of_int protocol in
+    let checksum = SBstr.get_uint16_be slice 10 in
+    let chk =
+      let { Slice.buf; off; _ } = slice in
+      Bstr.set_uint16_be buf (off + 10) 0;
+      Utcp.Checksum.digest ~off ~len:(ihl * 4) buf in
+    let* () = guard `Invalid_checksum @@ fun () -> checksum == chk in
+    let src = Ipaddr.V4.of_int32 (SBstr.get_int32_be slice 12) in
+    let dst = Ipaddr.V4.of_int32 (SBstr.get_int32_be slice 16) in
+    let opt =
+      if ihl == 5
+      then SBstr.empty
+      else SBstr.sub slice ~off:20 ~len:((ihl * 4) - 20) in
+    let checksum_and_length = { checksum; length } in
+    let pkt = { src; dst; uid; flags; off; ttl; protocol; checksum_and_length; opt } in
+    let payload = SBstr.shift slice (20 + SBstr.length opt) in
+    Ok (pkt, payload)
 
-  let encode_into pkt ?(off= 0) bstr =
-    encode_bstr partial_and_without_options pkt bstr (ref off)
+  let flags_and_off_to_int t =
+    let flags = Flag.to_int t.flags in
+    (flags lsl 13) lor t.off
+
+  let unsafe_encode_into t ?(off= 0) bstr =
+    let version_and_ihl = (4 lsl 4) lor 5 in
+    Bstr.set_uint8 bstr (off + 0) version_and_ihl;
+    Bstr.set_uint8 bstr (off + 1) 0;
+    Bstr.set_uint16_be bstr (off + 2) 0;
+    Bstr.set_uint16_be bstr (off + 4) t.uid;
+    Bstr.set_uint16_be bstr (off + 6) (flags_and_off_to_int t);
+    Bstr.set_uint8 bstr (off + 8) t.ttl;
+    Bstr.set_uint8 bstr (off + 9) (protocol_to_int t.protocol);
+    Bstr.set_uint16_be bstr (off + 10) 0;
+    Bstr.set_int32_be bstr (off + 12) (Ipaddr.V4.to_int32 t.src);
+    Bstr.set_int32_be bstr (off + 16) (Ipaddr.V4.to_int32 t.dst)
 end
 
 module Fragments = struct
@@ -174,19 +213,17 @@ module Fragments = struct
     | Packet.ICMP -> Fragment.ICMP
     | Packet.TCP -> Fragment.TCP
     | Packet.UDP -> Fragment.UDP
-    | Packet.Unknown -> invalid_arg "Non-supported protocol"
 
   let catch ~on_exn fn =
     try fn () with exn -> on_exn exn
 
-  let insert t pkt bstr =
+  let insert t pkt slice =
     let src = pkt.Packet.src
     and dst = pkt.Packet.dst
     and protocol = to_protocol pkt.Packet.protocol
     and uid = pkt.Packet.uid
     and off = pkt.Packet.off * 8
     and limit = not (List.exists ((==) Flag.MF) pkt.Packet.flags) in
-    let str = Bstr.to_string bstr in
     let key = { Fragment.src; dst; protocol; uid } in
     match Table.find t.table key with
     | exception Not_found ->
@@ -194,7 +231,7 @@ module Fragments = struct
         if Table.is_full t.table == false
         then
           let now = Miou_solo5.clock_monotonic () in
-          let payload = Fragment.singleton ~off ~limit str in
+          let payload = Fragment.singleton ~off ~limit slice in
           Table.add t.table key { payload; expire= now + t.to_expire }
         else Log.warn (fun m -> m "Cache is full, ignore IPv4 packet:%04x" uid)
     | (node, elt) ->
@@ -204,16 +241,18 @@ module Fragments = struct
       | Fragment.Payload (Sized _ as p) ->
           let on_exn _exn = Table.remove t.table node in
           catch ~on_exn @@ fun () ->
+          let str = SBstr.to_string slice in
           let p = Fragment.insert p ~off ~limit str in
           elt.payload <- Fragment.Payload p
       | Fragment.Payload (Unsized _ as p) ->
           let on_exn _exn = Table.remove t.table node in
           catch ~on_exn @@ fun () ->
+          let str = SBstr.to_string slice in
           let p = Fragment.insert p ~off ~limit str in
           elt.payload <- Fragment.Payload p
 
   type payload =
-    | Bstr of Bstr.t
+    | Slice of SBstr.t
     | String of string
 
   let get t =
@@ -224,8 +263,8 @@ module Fragments = struct
       | None -> ()
       | Some { payload= Fragment.Payload p; _ } ->
           match p with
-          | Fragment.Unfragmented bstr ->
-              res := (key, Bstr bstr) :: !res;
+          | Fragment.Unfragmented slice ->
+              res := (key, Slice slice) :: !res;
               Table.remove t.table node
           | Fragment.Sized _ as p ->
               if Fragment.is_complete p
@@ -247,33 +286,6 @@ end
 module Ethernet = Ethernet_miou_solo5
 module ARPv4 = Arp_miou_solo5
 
-let shift str n =
-  let len = String.length str in
-  String.sub str n (len - n)
-
-let _split_on ~fragment sstr =
-  let total = List.fold_left (fun acc str -> String.length str + acc) 0 sstr in
-  let lens = 1 + ((total - 1) / fragment) in
-  let bufs = Array.init lens (fun _ -> Bytes.create fragment) in
-  let sstr = ref sstr in
-  let dst_off = ref 0 in
-  let idx = ref 0 in
-  while !idx < lens && !sstr != [] do
-    let str = List.hd !sstr in
-    let len = Int.min (String.length str) (fragment - !dst_off) in
-    Bytes.blit_string str 0 bufs.(!idx) !dst_off len;
-    if !dst_off + len == fragment
-    then begin dst_off := 0; incr idx end
-    else dst_off := !dst_off + len;
-    if len == String.length str
-    then sstr := List.tl !sstr
-    else sstr := (shift str len) :: (List.tl !sstr)
-  done;
-  if !dst_off < fragment
-  then bufs.(lens - 1) <- Bytes.sub bufs.(lens - 1) 0 !dst_off;
-  Logs.debug (fun m -> m "Fragmentation done");
-  Array.to_list bufs |> List.map Bytes.unsafe_to_string
-
 type packet = Fragment.header =
   { src : Ipaddr.V4.t
   ; dst : Ipaddr.V4.t
@@ -282,7 +294,7 @@ type packet = Fragment.header =
 
 and protocol = Fragment.protocol = ICMP | TCP | UDP
 and payload = Fragments.payload =
-  | Bstr of Bstr.t
+  | Slice of SBstr.t
   | String of string
 
 type t =
@@ -394,34 +406,26 @@ module Writer = struct
 
   let unknown : type n. (z, n s, unit) m -> t = fun m -> Unknown m
 
-  type yield = last:bool -> (Bstr.t -> int) -> unit
-
   let ( let* ) x fn = Bind (x, fn)
   let ( let+ ) x fn = Write (x, fn)
   let return x = Return x
 
-  type ('a, 'b) refl = Refl : ('a, 'a) refl
+  type 'a user's_fn =
+    | Some : (Bstr.t -> int) -> 'a s user's_fn
+    | None : z user's_fn
 
-  let rec refl : type a b. a peano -> b peano -> (a, b) refl option
-    = fun a b -> match a, b with
-      | Zero, Zero -> Some Refl
-      | Succ a, Succ b ->
-          begin match refl a b with
-          | Some Refl -> Some Refl
-          | None -> None end
-      | _ -> None
+  type out = (Bstr.t -> int) -> unit
 
-  let rec go : type a p q. yield:yield -> p peano -> (p, q, a) m -> (q peano * a)
-    = fun ~yield s m -> match m, s with
-    | Return x, _ -> (s, x)
+  let rec go : type a p q. out:out -> p peano -> p user's_fn -> (p, q, a) m -> (q peano * q user's_fn * a)
+    = fun ~out s user's_fn0 m -> match m, s with
+    | Return x, _ -> (s, user's_fn0, x)
     | Bind (m, fn), s ->
-        let s, x = go ~yield s m in
-        go ~yield s (fn x)
-    | Write (m, user's_fn), s ->
-        let s', r = go ~yield (Succ s) m in
-        match refl s' (Succ s) with
-        | Some Refl -> yield ~last:true user's_fn; s', r
-        | None -> yield ~last:false user's_fn; s', r
+        let s, user's_fn1, x = go ~out s user's_fn0 m in
+        go ~out s user's_fn1 (fn x)
+    | Write (m, user's_fn1), s ->
+        let () = match user's_fn0 with None -> ()
+          | Some user's_fn0 -> out user's_fn0 in
+        go ~out (Succ s) (Some user's_fn1) m
 end
 
 let guard err fn = if fn () then Ok () else Error err
@@ -443,7 +447,7 @@ let max t =
 let src t = Ipaddr.V4.Prefix.address t.cidr
 
 let fixed pkt user's_fn len bstr =
-  Packet.encode_into pkt bstr;
+  Packet.unsafe_encode_into pkt bstr;
   Bstr.set_uint16_be bstr 2 (20 + len);
   let rest = Bstr.sub bstr ~off:20 ~len in
   user's_fn rest;
@@ -465,6 +469,7 @@ let write t ?(ttl= 38) ?src dst protocol p =
       Logs.debug ~src:t.src (fun m -> m "no gateway specified for writing IPv4 packets");
       Ok ()
   | Ok macaddr ->
+      Logs.debug ~src:t.src (fun m -> m "%a is-at %a" Ipaddr.V4.pp dst Macaddr.pp macaddr);
       let src = Option.value ~default:(Ipaddr.V4.Prefix.address t.cidr) src in
       let mtu = Ethernet.mtu t.eth in
       match p with
@@ -472,7 +477,7 @@ let write t ?(ttl= 38) ?src dst protocol p =
           let pkt =
             { Packet.src; dst; uid= 0; flags= Flag._none; off= 0; ttl
             ; protocol; checksum_and_length= Packet.Partial
-            ; opt= Bstr.empty } in
+            ; opt= SBstr.empty } in
           let protocol = Ethernet.IPv4 in
           let fn = fixed pkt user's_fn total_length in
           Ethernet.write_into t.eth ~dst:macaddr ~protocol fn;
@@ -489,7 +494,7 @@ let write t ?(ttl= 38) ?src dst protocol p =
                   if next != Seq.Nil then Flag._mf else Flag._none in
                 let pkt =
                   { Packet.src; dst; uid; flags; off= off lsr 3; ttl; protocol
-                  ; checksum_and_length= Packet.Partial; opt= Bstr.empty } in
+                  ; checksum_and_length= Packet.Partial; opt= SBstr.empty } in
                 let protocol = Ethernet.IPv4 in
                 let fn = fixed pkt user's_fn size in
                 Ethernet.write_into t.eth ~dst:macaddr ~protocol fn;
@@ -501,23 +506,14 @@ let write t ?(ttl= 38) ?src dst protocol p =
           let uid = Mirage_crypto_rng.generate 2 in
           let uid = String.get_uint16_be uid 0 in
           let off = ref 0 in
-          let seq =
-            let module M = struct
-              type _ Effect.t += Yield : { last : bool; user's_fn : (Bstr.t -> int) } -> unit Effect.t
-            end in
-            let yield ~last user's_fn = Effect.perform (M.Yield { last; user's_fn }) in
-            fun () -> match Writer.go ~yield Writer.Zero m with
-            | Succ _, () -> Seq.Nil
-            | effect M.Yield { last; user's_fn }, k ->
-                Seq.Cons ((last, user's_fn), Effect.Deep.continue k) in
-          let fn (last, user's_fn) =
+          let out ~last user's_fn =
             let fn bstr =
               let flags = if last then Flag._none else Flag._mf in
               let pkt =
                 { Packet.src; dst; uid; flags; off= !off lsr 3; ttl
                 ; protocol ; checksum_and_length= Packet.Partial
-                ; opt= Bstr.empty } in
-              Packet.encode_into pkt bstr;
+                ; opt= SBstr.empty } in
+              Packet.unsafe_encode_into pkt bstr;
               let len = user's_fn (Bstr.sub bstr ~off:20 ~len:(Bstr.length bstr - 20)) in
               Bstr.set_uint16_be bstr 2 (20 + len);
               let len = (len + 0b111) / 8 * 8 in
@@ -527,32 +523,29 @@ let write t ?(ttl= 38) ?src dst protocol p =
               20 + len in
             let protocol = Ethernet.IPv4 in
             Ethernet.write_into t.eth ~dst:macaddr ~protocol fn in
-          Seq.iter fn seq;
+          let _, Writer.Some user's_fn, () = Writer.go ~out:(out ~last:false) Writer.Zero Writer.None m in
+          out ~last:true user's_fn;
           Ok ()
 
 let input t pkt =
   match Packet.decode pkt.Ethernet.payload with
-  | Error _ ->
-      let str = Bstr.to_string pkt.payload in
-      Logs.err ~src:t.src (fun m -> m "Invalid IPv4 packet:");
+  | Error err ->
+      let str = SBstr.to_string pkt.payload in
+      Logs.err ~src:t.src (fun m -> m "Invalid IPv4 packet: %a" Packet.pp_error err);
       Logs.err ~src:t.src (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) str)
   | Ok (ipv4, payload) ->
       let dst = ipv4.Packet.dst in
-      if Bstr.length payload == 0
-      then Logs.debug ~src:t.src (fun m -> m "drop empty IPv4 packet")
-      else if ipv4.Packet.protocol == Unknown
-      then Logs.debug ~src:t.src (fun m -> m "drop IPv4 packet with unknown protocol")
-      else if Ipaddr.V4.(compare dst (Prefix.address t.cidr)) == 0
-      || Ipaddr.V4.(compare dst Ipaddr.V4.broadcast) == 0
-      || Ipaddr.V4.(compare dst (Prefix.broadcast t.cidr)) == 0
+      if SBstr.length payload > 0
+      && (Ipaddr.V4.(compare dst (Prefix.address t.cidr)) == 0
+          || Ipaddr.V4.(compare dst Ipaddr.V4.broadcast) == 0
+          || Ipaddr.V4.(compare dst (Prefix.broadcast t.cidr)) == 0)
       then begin
         Logs.debug ~src:t.src (fun m -> m "Incoming IPv4 packet from %a"
           Ipaddr.V4.pp ipv4.Packet.src);
         Fragments.insert t.cache ipv4 payload;
         let pkts = Fragments.get t.cache in
         t.handler pkts 
-      end else Logs.debug ~src:t.src (fun m -> m "drop IPv4 packet (%a -> %a)"
-        Ipaddr.V4.pp ipv4.Packet.src Ipaddr.V4.pp ipv4.Packet.dst)
+      end
 
 let _cnt = Atomic.make 0
 

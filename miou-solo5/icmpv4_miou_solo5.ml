@@ -194,7 +194,7 @@ let kill (prm, _) = Miou.cancel prm
 
 let transfer (_, t) (pkt, payload) =
   let payload = match payload with
-    | IPv4.Bstr bstr -> Bstr.to_string bstr
+    | IPv4.Slice bstr -> Slice_bstr.to_string bstr
     | IPv4.String str -> str in
   Miou.Mutex.protect t.mutex @@ fun () ->
   Queue.push (pkt, payload) t.queue;
