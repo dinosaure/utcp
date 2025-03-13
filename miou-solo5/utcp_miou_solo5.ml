@@ -20,6 +20,8 @@ module Buffer = struct
   let available { bstr; off; len; } =
     Bstr.length bstr - off - len
 
+  let length { len; _ } = len
+
   let compress t =
     if t.len == 0 then begin
       t.off <- 0;
@@ -103,22 +105,14 @@ module TCPv4 = struct
     ; buffer : Buffer.t
     ; mutable closed : bool }
 
-  let pp_accept ppf = function
-    | Await _ -> Fmt.string ppf "await"
-    | Pending q -> Fmt.pf ppf "pending(%d)" (Queue.length q)
-
   let[@inline] now () =
     let n = Miou_solo5.clock_monotonic () in
     Mtime.of_uint64_ns (Int64.of_int n)
 
   let write_ipv4 ipv4 (src, dst, seg) =
     let len = Utcp.Segment.length seg in
-    Log.debug (fun m -> m "write-out %d byte(s) to %a" len Ipaddr.V4.pp dst);
-    if len > IPv4.max ipv4
-    then invalid_arg "Impossible to write such IPv4 packet, too huge.";
+    Log.debug (fun m -> m "write-out %d byte(s) to %a" (20 (* ipv4 packet *) + len) Ipaddr.V4.pp dst);
     let fn bstr =
-      (* TODO(dinosaure): the IPv4 can actually pass the pseudo-header
-         but μTCP calculate it for us. *)
       let cs = Cstruct.of_bigarray bstr in
       let src = Ipaddr.V4 src
       and dst = Ipaddr.V4 dst in
@@ -169,7 +163,8 @@ module TCPv4 = struct
                 List.iter (write_ip t.state.ipv4) segs;
                 Logs.debug ~src:t.src (fun m -> m "recv new packet (%d byte(s)) (second)"
                   (Cstruct.length data));
-                fill t data
+                if Cstruct.length data == 0
+                then Eof else fill t data
             | Error `Eof -> Eof
             | Error (`Msg msg) ->
                 Logs.err ~src:t.src (fun m -> m "%a error while read (second recv): %s"
@@ -193,12 +188,13 @@ module TCPv4 = struct
       let len = match len with
         | Some len -> len
         | None -> Bytes.length buf - dst_off in
-      match read_into t with
-      | Filled ->
-          let fn bstr ~off:src_off ~len:src_len =
-            let len = Int.min src_len len in
-            Bstr.blit_to_bytes bstr ~src_off buf ~dst_off ~len; len in
-          Buffer.get t.buffer ~fn
+      let fn bstr ~off:src_off ~len:src_len =
+        let len = Int.min src_len len in
+        Bstr.blit_to_bytes bstr ~src_off buf ~dst_off ~len; len in
+      if Buffer.length t.buffer > 0
+      then Buffer.get t.buffer ~fn
+      else match read_into t with
+      | Filled -> Buffer.get t.buffer ~fn
       | Eof ->
           Logs.debug ~src:t.src (fun m -> m "End-of-transmision received");
           0
@@ -229,9 +225,9 @@ module TCPv4 = struct
           Utcp.pp_flow t.flow msg);
         raise Closed_by_peer
     | Ok (tcp, bytes_sent, c, segs) ->
-        Logs.debug ~src:t.src (fun m -> m "write %d byte(s)" bytes_sent);
         t.state.tcp <- tcp;
         List.iter (write_ip t.state.ipv4) segs;
+        Logs.debug ~src:t.src (fun m -> m "write %d byte(s)" bytes_sent);
         if bytes_sent < Cstruct.length cs
         then
           let result = Notify.await c in
@@ -321,10 +317,11 @@ module TCPv4 = struct
           Log.debug (fun m -> m "signal (%a)(%d)" Utcp.pp_flow flow (List.length cs));
           List.iter (Notify.signal _ok) cs in
     Option.fold ~none ~some ev;
-    List.iter (fun out -> Queue.push out state.queue) segs;
-    if List.length segs > 0
+    Logs.debug (fun m -> m "%d segment(s) produced" (List.length segs));
+    List.iter (fun out -> Queue.push out state.queue) segs
+    (* if List.length segs > 0
     then Miou.Mutex.protect state.mutex @@ fun () ->
-      Miou.Condition.signal state.condition
+      Miou.Condition.signal state.condition *)
 
   let rec transfer state acc = match Queue.pop state.queue with
     | exception Queue.Empty -> acc
@@ -343,11 +340,11 @@ module TCPv4 = struct
     let prm0 = Miou.async @@ fun () ->
       Miou_solo5.sleep 100_000_000; Tick in
     match Miou.await_first [ prm0; prm1 ] with
-    | Ok Tick -> []
-    | Ok (Out outs) -> outs
+    | Ok Tick -> `Tick
+    | Ok (Out outs) -> `Out outs
     | Error exn ->
         Log.err (fun m -> m "Unexpected exception: %s" (Printexc.to_string exn));
-        []
+        `Out []
 
   let rec clean orphans = match Miou.care orphans with
     | None | Some None -> ()
@@ -361,11 +358,14 @@ module TCPv4 = struct
 
   let rec daemon state n =
     clean state.orphans;
-    let user's_outs = write_or_sync state in
-    let tcp, drops, outs = Utcp.timer state.tcp (now ()) in
-    state.tcp <- tcp;
-    let outs = List.rev_append user's_outs outs in
-    let fn out = ignore (Miou.async ~orphans:state.orphans @@ fun () ->
+    let outs, drops, is_tick = match write_or_sync state with
+      | `Tick ->
+        let tcp, drops, outs = Utcp.timer state.tcp (now ()) in
+        state.tcp <- tcp;
+        outs, drops, true
+      | `Out outs -> outs, [], false in
+    let fn out =
+      Log.debug (fun m -> m "write new TCPv4 packet from daemon (tick: %b)" is_tick);
       try write_ip state.ipv4 out
       with
       | Net_unreach ->
@@ -374,7 +374,7 @@ module TCPv4 = struct
       | exn ->
         let (src, dst, _) = out in
         Log.err (fun m -> m "Unexpected exception (%a -> %a): %s"
-          Ipaddr.pp src Ipaddr.pp dst (Printexc.to_string exn))) in
+          Ipaddr.pp src Ipaddr.pp dst (Printexc.to_string exn)) in
     List.iter fn outs;
     let fn (_id, err, rcv, snd) =
       let err = match err with

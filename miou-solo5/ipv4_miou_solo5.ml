@@ -480,7 +480,7 @@ let write t ?(ttl= 38) ?src dst protocol p =
             ; opt= SBstr.empty } in
           let protocol = Ethernet.IPv4 in
           let fn = fixed pkt user's_fn total_length in
-          Ethernet.write_into t.eth ~dst:macaddr ~protocol fn;
+          Ethernet.write_directly_into t.eth ~dst:macaddr ~protocol fn;
           Ok ()
       | Writer.Fragmented { total_length; fn; } ->
           let uid = Mirage_crypto_rng.generate 2 in
@@ -497,12 +497,12 @@ let write t ?(ttl= 38) ?src dst protocol p =
                   ; checksum_and_length= Packet.Partial; opt= SBstr.empty } in
                 let protocol = Ethernet.IPv4 in
                 let fn = fixed pkt user's_fn size in
-                Ethernet.write_into t.eth ~dst:macaddr ~protocol fn;
+                Ethernet.write_directly_into t.eth ~dst:macaddr ~protocol fn;
                 if next != Seq.Nil && total_length - size > 0
                 then go (off + size) (total_length - size) next in
           go 0 total_length (fn ());
           Ok ()
-      | Unknown m ->
+      | Writer.Unknown m ->
           let uid = Mirage_crypto_rng.generate 2 in
           let uid = String.get_uint16_be uid 0 in
           let off = ref 0 in
@@ -522,8 +522,9 @@ let write t ?(ttl= 38) ?src dst protocol p =
               Bstr.set_uint16_be bstr 10 chk;
               20 + len in
             let protocol = Ethernet.IPv4 in
-            Ethernet.write_into t.eth ~dst:macaddr ~protocol fn in
-          let _, Writer.Some user's_fn, () = Writer.go ~out:(out ~last:false) Writer.Zero Writer.None m in
+            Ethernet.write_directly_into t.eth ~dst:macaddr ~protocol fn in
+          let _, Writer.Some user's_fn, () =
+            Writer.go ~out:(out ~last:false) Writer.Zero Writer.None m in
           out ~last:true user's_fn;
           Ok ()
 

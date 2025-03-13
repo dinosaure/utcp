@@ -123,7 +123,7 @@ let write t (arp, dst) =
   (* NOTE(dinosaure): we already check, in [create] that the MTU is more than
      [28] bytes. The buffer given by [Ethernet] is also more than [28] bytes. *)
   let fn = Packet.unsafe_encode_into arp ~off:0 in
-  Ethernet.write_into t.eth ~dst ~protocol:Ethernet.ARPv4 fn
+  Ethernet.write_directly_into t.eth ~dst ~protocol:Ethernet.ARPv4 fn
 
 let guard err fn = if fn () then Ok () else Error err
 let macaddr t = t.macaddr

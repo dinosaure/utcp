@@ -114,23 +114,23 @@ let read_or_write t =
       Logs.err ~src:t.src (fun m -> m "Unexpected exception: %s" (Printexc.to_string exn));
       Out
 
-let write_into t (packet : (Bstr.t -> int) packet) =
+let write_directly_into t (packet : (Bstr.t -> int) packet) =
   let fn = packet.payload in
   let src = Option.value ~default:t.mac packet.src in
   let pkt = { Packet.src; dst= packet.dst; protocol= Some packet.protocol } in
   Packet.encode_into pkt ~off:0 t.bstr_oc;
   let bstr = Bstr.sub t.bstr_oc ~off:14 ~len:(Bstr.length t.bstr_oc - 14) in
   let plus = fn bstr in
-  Logs.debug ~src:t.src (fun m -> m "write ethernet packet src:%a -> dst:%a"
-    Macaddr.pp src Macaddr.pp packet.dst);
+  Logs.debug ~src:t.src (fun m -> m "write ethernet packet src:%a -> dst:%a (%d byte(s))"
+    Macaddr.pp src Macaddr.pp packet.dst plus);
   Logs.debug ~src:t.src (fun m -> m "@[<hov>%a@]"
     (Hxd_string.pp Hxd.default) (Bstr.sub_string t.bstr_oc ~off:0 ~len:(14 + plus)));
   Miou_solo5.Net.write_bigstring t.net ~off:0 ~len:(14 + plus) t.bstr_oc
 
 let rec daemon t =
-  Queue.iter (write_into t) t.frames;
+  Queue.iter (write_directly_into t) t.frames;
   Queue.clear t.frames;
-  match read_or_write t with
+  match read_or_write t with (* is waiting new income packets *)
   | Out -> daemon t
   | In payload ->
      let ok ({ Packet.protocol; src; dst }, payload) =
@@ -157,6 +157,10 @@ let rec daemon t =
        Logs.err ~src:t.src (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) str) in
      let () = Result.fold ~ok ~error (Packet.decode payload) in
      daemon t
+
+let write_directly_into t ?src ~dst ~protocol fn =
+  let pkt = { src; dst; protocol; payload= fn } in
+  write_directly_into t pkt
 
 let write_into t ?(force= true) ?src ~dst ~protocol fn =
   match force with
