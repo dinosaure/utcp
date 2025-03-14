@@ -386,8 +386,8 @@ let tcp_output_really_helper now (src, src_port, dst, dst_port) window_probe con
   let snd_nxt =
     if fin &&
        Sequence.equal (Sequence.addi cb.State.snd_nxt dlen) (Sequence.incr last_sndq_data_seq) &&
-       not (Sequence.equal cb.State.snd_una cb.State.iss) ||
-       Sequence.window cb.State.snd_nxt cb.State.iss = 2
+       (not (Sequence.equal cb.State.snd_una cb.State.iss) ||
+       Sequence.window cb.State.snd_nxt cb.State.iss = 2)
     then
       Sequence.addi cb.State.snd_nxt (-1)
     else
