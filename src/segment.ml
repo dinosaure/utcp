@@ -385,9 +385,9 @@ let tcp_output_really_helper now (src, src_port, dst, dst_port) window_probe con
       data has yet been sent over the socket  :*)
   let snd_nxt =
     if fin &&
-       (Sequence.equal (Sequence.addi cb.State.snd_nxt dlen) (Sequence.incr last_sndq_data_seq) &&
+       Sequence.equal (Sequence.addi cb.State.snd_nxt dlen) (Sequence.incr last_sndq_data_seq) &&
        not (Sequence.equal cb.State.snd_una cb.State.iss) ||
-        Sequence.window cb.State.snd_nxt cb.State.iss = 2)
+       Sequence.window cb.State.snd_nxt cb.State.iss = 2
     then
       Sequence.addi cb.State.snd_nxt (-1)
     else
@@ -643,7 +643,8 @@ let decode_and_validate ~src ~dst data =
     guard (computed = pkt_csum)
       (`Msg (Fmt.str "invalid checksum: computed 0x%04X, decoded 0x%04X in src %a dst %a"
                computed pkt_csum
-               Ipaddr.pp src Ipaddr.pp dst))
+               Ipaddr.pp src Ipaddr.pp dst
+               Cstruct.hexdump_pp data))
   in
   let* () =
     match src, dst with
