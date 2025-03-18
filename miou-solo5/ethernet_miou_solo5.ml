@@ -52,15 +52,15 @@ module Packet = struct
     | IPv4 -> 0x0800
     | IPv6 -> 0x86dd
 
-  let decode bstr =
+  let decode bstr ~len =
     let ( let* ) = Result.bind in
     let* () = guard `Invalid_ethernet_packet @@ fun () ->
-      Bstr.length bstr >= 14 in
+      len >= 14 in
     let dst = Macaddr.of_octets_exn (Bstr.sub_string bstr ~off:0 ~len:6) in
     let src = Macaddr.of_octets_exn (Bstr.sub_string bstr ~off:6 ~len:6) in
     let protocol = Bstr.get_uint16_be bstr 12 in
     let protocol = protocol_of_int protocol in
-    let payload = Slice_bstr.make ~off:14 bstr in
+    let payload = Slice_bstr.make ~off:14 ~len:(len - 14) bstr in
     Ok ({ src; dst; protocol }, payload)
 
   let encode_into t ?(off= 0) bstr = match t.protocol with
@@ -80,11 +80,8 @@ type protocol = Packet.protocol =
 type t =
   { net : Miou_solo5.Net.t
   ; mutable handler : handler
-  ; frames : (Bstr.t -> int) packet Queue.t
   ; mtu : int
   ; mac : Macaddr.t
-  ; mutex : Miou.Mutex.t
-  ; condition : Miou.Condition.t
   ; src : Logs.src
   ; bstr_ic : Bstr.t
   ; bstr_oc : Bstr.t }
@@ -96,23 +93,6 @@ and 'a packet =
 and handler = Slice_bstr.t packet -> unit
 
 let mac { mac; _ } = mac
-
-type event = In of Bstr.t | Out
-
-let read_or_write t =
-  let prm1 = Miou.async @@ fun () ->
-    Miou.Mutex.protect t.mutex @@ fun () ->
-    if Queue.is_empty t.frames
-    then Miou.Condition.wait t.condition t.mutex;
-    Out in
-  let prm0 = Miou.async @@ fun () ->
-    let len = Miou_solo5.Net.read_bigstring t.net t.bstr_ic in
-    In (Bstr.sub t.bstr_ic ~off:0 ~len) in
-  match Miou.await_first [ prm0; prm1 ] with
-  | Ok value -> value
-  | Error exn ->
-      Logs.err ~src:t.src (fun m -> m "Unexpected exception: %s" (Printexc.to_string exn));
-      Out
 
 let write_directly_into t (packet : (Bstr.t -> int) packet) =
   let fn = packet.payload in
@@ -128,48 +108,35 @@ let write_directly_into t (packet : (Bstr.t -> int) packet) =
   Miou_solo5.Net.write_bigstring t.net ~off:0 ~len:(14 + plus) t.bstr_oc
 
 let rec daemon t =
-  Queue.iter (write_directly_into t) t.frames;
-  Queue.clear t.frames;
-  match read_or_write t with (* is waiting new income packets *)
-  | Out -> daemon t
-  | In payload ->
-     let ok ({ Packet.protocol; src; dst }, payload) =
-       match protocol with
-       | None -> ()
-       | Some protocol ->
-         let packet =
-           { src= Some src; dst; protocol; payload } in
-         if Macaddr.compare dst t.mac == 0
-         || Macaddr.is_unicast dst == false
-         then
-           try t.handler packet
-           with exn ->
-             Logs.err ~src:t.src (fun m -> m "Unexpected exception from the user's handler: %s"
-               (Printexc.to_string exn));
-         else begin
-           let payload = Slice_bstr.to_string payload in
-           Logs.debug ~src:t.src (fun m -> m "Ignore (%a -> %a):" Macaddr.pp src Macaddr.pp dst);
-           Logs.debug ~src:t.src (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) payload);
-         end in
-     let error _ =
-       let str = Bstr.to_string payload in
-       Logs.err ~src:t.src (fun m -> m "Invalid Ethernet packet");
-       Logs.err ~src:t.src (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) str) in
-     let () = Result.fold ~ok ~error (Packet.decode payload) in
-     daemon t
+  let len = Miou_solo5.Net.read_bigstring t.net t.bstr_ic in
+  let ok ({ Packet.protocol; src; dst }, payload) =
+    match protocol with
+    | None -> ()
+    | Some protocol ->
+      let packet =
+        { src= Some src; dst; protocol; payload } in
+      if Macaddr.compare dst t.mac == 0
+      || Macaddr.is_unicast dst == false
+      then
+        try t.handler packet
+        with exn ->
+          Logs.err ~src:t.src (fun m -> m "Unexpected exception from the user's handler: %s"
+            (Printexc.to_string exn));
+      else begin
+        let payload = Slice_bstr.to_string payload in
+        Logs.debug ~src:t.src (fun m -> m "Ignore (%a -> %a):" Macaddr.pp src Macaddr.pp dst);
+        Logs.debug ~src:t.src (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) payload);
+      end in
+  let error _ =
+    let str = Bstr.sub_string t.bstr_ic ~off:0 ~len in
+    Logs.err ~src:t.src (fun m -> m "Invalid Ethernet packet");
+    Logs.err ~src:t.src (fun m -> m "@[<hov>%a@]" (Hxd_string.pp Hxd.default) str) in
+  let () = Result.fold ~ok ~error (Packet.decode t.bstr_ic ~len) in
+  daemon t
 
 let write_directly_into t ?src ~dst ~protocol fn =
   let pkt = { src; dst; protocol; payload= fn } in
   write_directly_into t pkt
-
-let write_into t ?(force= true) ?src ~dst ~protocol fn =
-  match force with
-  | true ->
-    Miou.Mutex.protect t.mutex @@ fun () ->
-    Queue.push { src; dst; protocol; payload= fn } t.frames;
-    Miou.Condition.signal t.condition
-  | false ->
-    Queue.push { src; dst; protocol; payload= fn } t.frames
 
 let guard err fn = if fn () then Ok () else Error err
 
@@ -188,12 +155,9 @@ let create ?(mtu= 1500) ?(handler= ignore) mac net =
   let t =
     { net
     ; handler
-    ; frames= Queue.create ()
     ; mtu
     ; mac
     ; src
-    ; mutex= Miou.Mutex.create ()
-    ; condition= Miou.Condition.create ()
     ; bstr_ic
     ; bstr_oc } in
   let daemon = Miou.async @@ fun () -> daemon t in

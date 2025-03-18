@@ -24,15 +24,6 @@ val write_directly_into :
   -> (Bstr.t -> int)
   -> unit
 
-val write_into :
-     t
-  -> ?force:bool
-  -> ?src:Macaddr.t
-  -> dst:Macaddr.t
-  -> protocol:protocol
-  -> (Bstr.t -> int)
-  -> unit
-
 val create :
      ?mtu:int
   -> ?handler:(Slice_bstr.t packet -> unit)
