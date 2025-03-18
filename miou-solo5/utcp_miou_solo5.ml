@@ -309,7 +309,8 @@ module TCPv4 = struct
       | `Established (flow, Some c) ->
           Log.debug (fun m -> m "connection established (%a)" Utcp.pp_flow flow);
           Notify.signal _ok c
-      | `Drop (flow, c, cs) ->
+      | `Drop fn ->
+          let flow, c, cs = fn () in
           Log.debug (fun m -> m "drop (%a)" Utcp.pp_flow flow);
           List.iter (Notify.signal _eof) cs;
           Option.iter (Notify.signal _ok) c
