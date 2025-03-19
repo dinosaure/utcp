@@ -101,11 +101,24 @@ let make ?(max= 1 lsl 4) () =
 
 let is_full t = t.size == t.max
 
+let equal_protocol a b =
+  match a, b with
+  | Fragment.ICMP, Fragment.ICMP -> true
+  | Fragment.TCP, Fragment.TCP -> true
+  | Fragment.UDP, Fragment.UDP -> true
+  | _ -> false
+
+let equal a b =
+  Ipaddr.V4.compare a.Fragment.src b.Fragment.src == 0
+  && Ipaddr.V4.compare a.Fragment.dst b.Fragment.dst == 0
+  && a.Fragment.uid == b.Fragment.uid
+  && equal_protocol a.Fragment.protocol b.Fragment.protocol
+
 let rec go key root curr =
   if curr == root then raise_notrace Not_found;
   let node = node_of_seq curr in
   if node.active
-  && compare node.key key == 0
+  && equal node.key key
   then node
   else go key root node.next
 
@@ -114,21 +127,21 @@ let node_of_key t ~key =
   let seq = ref root.next in
   if root == !seq
   then raise_notrace Not_found ;
-  if Stdlib.compare (node_of_seq !seq).key key == 0
+  if equal (node_of_seq !seq).key key
   && (node_of_seq !seq).active
   then node_of_seq !seq
   else begin
     seq := !seq.next;
     if root == !seq
     then raise_notrace Not_found ;
-    if Stdlib.compare (node_of_seq !seq).key key == 0
+    if equal (node_of_seq !seq).key key
     && (node_of_seq !seq).active
     then node_of_seq !seq
     else begin
       seq := !seq.next;
       if root == !seq
       then raise_notrace Not_found;
-      if Stdlib.compare (node_of_seq !seq).key key == 0
+      if equal (node_of_seq !seq).key key
       then node_of_seq !seq
       else go key root !seq.next
     end

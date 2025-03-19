@@ -548,9 +548,34 @@ let make_ack cb ~fin (src, src_port, dst, dst_port) =
     flag = if fin then Some `Fin else None ;
     push = false ; window ; options = [] ; payload = Cstruct.empty }
 
-let checksum ~src ~dst buf =
-  let plen = Cstruct.length buf in
+let checksum ~src ~dst cs =
+  let len = Cstruct.length cs in
+  let protocol = 0x06 in
   (* construct pseudoheader *)
+  match src, dst with
+  | Ipaddr.V4 src, Ipaddr.V4 dst ->
+      let buf = Bytes.make 12 '\000' in
+      Bytes.set_int32_be buf 0 (Ipaddr.V4.to_int32 src);
+      Bytes.set_int32_be buf 4 (Ipaddr.V4.to_int32 dst);
+      Bytes.set_uint8 buf 9 protocol;
+      Bytes.set_uint16_be buf 10 len;
+      let sum = Checksum.feed_string ~off:0 ~len:12 0 (Bytes.unsafe_to_string buf) in
+      Cstruct.BE.set_uint16 cs 16 0;
+      let sum = Checksum.feed_cstruct sum cs in
+      Checksum.finally sum
+  | Ipaddr.V6 src, Ipaddr.V6 dst ->
+      let buf = Bytes.make 40 '\000' in
+      Bytes.blit_string (Ipaddr.V6.to_octets src) 0 buf 0 16;
+      Bytes.blit_string (Ipaddr.V6.to_octets dst) 0 buf 16 32;
+      Bytes.set_uint16_be buf 34 len;
+      Bytes.set_uint8 buf 39 protocol;
+      let sum = Checksum.feed_string ~off:0 ~len:12 0 (Bytes.unsafe_to_string buf) in
+      Cstruct.BE.set_uint16 cs 16 0;
+      let sum = Checksum.feed_cstruct sum cs in
+      Checksum.finally sum
+  | _ -> invalid_arg "mixing IPv4 and IPv6 addresses not supported"
+       
+(*
   let mybuf, off =
     let protocol = 0x06 in
     match src, dst with
@@ -576,6 +601,7 @@ let checksum ~src ~dst buf =
   Cstruct.BE.set_uint16 mybuf (off + 16) 0;
   (* compute checksum *)
   Checksum.digest_cstruct mybuf
+*)
 
 let encode_into buf t =
   let opt_len = length_options t.options in
@@ -638,7 +664,7 @@ let decode_and_validate ~src ~dst data =
   let* t, pkt_csum = decode data in
   let computed = checksum ~src ~dst data in
   (* these are already checks done in deliver_in_4, etc. *)
-  let pkt_csum = if pkt_csum = 0xffff then 0x0 else pkt_csum in
+  let _pkt_csum = if pkt_csum = 0xffff then 0x0 else pkt_csum in
   let* () =
     guard (computed = pkt_csum) (`Msg "invalid checksum")
   in

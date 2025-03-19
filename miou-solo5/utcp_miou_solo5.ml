@@ -63,7 +63,7 @@ module Notify = struct
     ; condition= Miou.Condition.create () }
 
   let signal value t =
-    Miou.Mutex.protect t.mutex @@ fun () ->
+    (* Miou.Mutex.protect t.mutex @@ fun () -> *)
     Queue.push value t.queue;
     Miou.Condition.signal t.condition
 
@@ -91,7 +91,6 @@ module TCPv4 = struct
     ; queue : Utcp.output Queue.t
     ; mutex : Miou.Mutex.t
     ; condition : Miou.Condition.t
-    ; orphans : unit Miou.orphans
     ; accept : (int, accept) Hashtbl.t }
 
   and accept =
@@ -319,53 +318,18 @@ module TCPv4 = struct
     Option.fold ~none ~some ev;
     Logs.debug (fun m -> m "%d segment(s) produced" (List.length segs));
     List.iter (fun out -> Queue.push out state.queue) segs
-    (* if List.length segs > 0
-    then Miou.Mutex.protect state.mutex @@ fun () ->
-      Miou.Condition.signal state.condition *)
 
   let rec transfer state acc = match Queue.pop state.queue with
     | exception Queue.Empty -> acc
     | out -> transfer state (out :: acc)
 
-  type event =
-    | Out of Utcp.output list
-    | Tick
-
-  let write_or_sync state =
-    let prm1 = Miou.async @@ fun () ->
-      Miou.Mutex.protect state.mutex @@ fun () ->
-      if Queue.is_empty state.queue
-      then Miou.Condition.wait state.condition state.mutex;
-      Out (transfer state []) in
-    let prm0 = Miou.async @@ fun () ->
-      Miou_solo5.sleep 100_000_000; Tick in
-    match Miou.await_first [ prm0; prm1 ] with
-    | Ok Tick -> `Tick
-    | Ok (Out outs) -> `Out outs
-    | Error exn ->
-        Log.err (fun m -> m "Unexpected exception: %s" (Printexc.to_string exn));
-        `Out []
-
-  let rec clean orphans = match Miou.care orphans with
-    | None | Some None -> ()
-    | Some (Some prm) ->
-        match Miou.await prm with
-        | Ok () -> clean orphans
-        | Error exn ->
-            Log.err (fun m -> m "Unexpected exception from a task: %s"
-              (Printexc.to_string exn));
-            clean orphans
-
   let rec daemon state n =
-    clean state.orphans;
-    let outs, drops, is_tick = match write_or_sync state with
-      | `Tick ->
-        let tcp, drops, outs = Utcp.timer state.tcp (now ()) in
-        state.tcp <- tcp;
-        outs, drops, true
-      | `Out outs -> outs, [], false in
+    let handler's_outs = transfer state [] in
+    let tcp, drops, outs = Utcp.timer state.tcp (now ()) in
+    state.tcp <- tcp;
+    let outs = List.rev_append handler's_outs outs in
     let fn out =
-      Log.debug (fun m -> m "write new TCPv4 packet from daemon (tick: %b)" is_tick);
+      Log.debug (fun m -> m "write new TCPv4 packet from daemon");
       try write_ip state.ipv4 out
       with
       | Net_unreach ->
@@ -386,6 +350,7 @@ module TCPv4 = struct
       Notify.signal err rcv;
       Notify.signal err snd in
     List.iter fn drops;
+    Miou_solo5.sleep 100_000_000;
     daemon state (n+1)
 
   type listen = Listen of int [@@unboxed]
@@ -418,9 +383,8 @@ module TCPv4 = struct
     let tcp = Utcp.empty Notify.create name Mirage_crypto_rng.generate in
     let mutex = Miou.Mutex.create () in
     let condition = Miou.Condition.create () in
-    let orphans = Miou.orphans () in
     let accept = Hashtbl.create 0x10 in
-    let state = { tcp; ipv4; queue= Queue.create (); mutex; condition; orphans; accept } in
+    let state = { tcp; ipv4; queue= Queue.create (); mutex; condition; accept } in
     let prm = Miou.async (fun () -> daemon state 0) in
     prm, state
 
