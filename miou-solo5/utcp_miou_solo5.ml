@@ -117,7 +117,7 @@ module TCPv4 = struct
       and dst = Ipaddr.V4 dst in
       Utcp.Segment.encode_and_checksum_into (now ()) cs ~src ~dst seg in
     let pkt = IPv4.Writer.into ipv4 ~len fn in
-    match IPv4.write ipv4 ~src dst IPv4.TCP pkt with
+    match IPv4.write ipv4 ~src dst ~protocol:6 pkt with
     | Ok () -> ()
     | Error `Route_not_found ->
         Log.err (fun m -> m "%a is unreachable" Ipaddr.V4.pp dst);

@@ -2,21 +2,10 @@ let src = Logs.Src.create "fragment"
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
-type header =
-  { src : Ipaddr.V4.t
-  ; dst : Ipaddr.V4.t
-  ; protocol : protocol
-  ; uid : int }
-and protocol = ICMP | TCP | UDP
-and fragmented = |
-and unfragmented = |
+type t =
+  | Unsized : Ropes.unknown Ropes.t -> t
+  | Sized : Diet.t * bytes -> t
 
-type 'a payload =
-  | Unsized : Ropes.unknown Ropes.t -> fragmented payload
-  | Sized : Diet.t * bytes -> fragmented payload
-  | Unfragmented : Slice_bstr.t -> unfragmented payload
-
-type t = Payload : 'a payload -> t [@@unboxed]
 (* A payload can be:
    - an entire packet (Unfragmented)
    - the start of a fragment whose end is unknown (Unsized)
@@ -30,7 +19,7 @@ type t = Payload : 'a payload -> t [@@unboxed]
    [Overlap] exception.
 
    Then, if we know the last fragment, we know the final size of our packet. We
-   can therefore [Ropes.fix] our ropes. This consists of creating a final buffer
+   can therefore [Ropes.fixed] our ropes. This consists of creating a final buffer
    in which we will copy all our fragments (a reassembly, in short). However,
    this does not mean that we have received the whole of our package; there may
    be holes.
@@ -61,28 +50,33 @@ let singleton ~off ?(limit= false) slice : t =
     let empty = Ropes.(Unknown Limitless) in
     let ropes = Ropes.insert ~off str empty in
     Log.debug (fun m -> m "+%d byte(s) %@ %d" (String.length str) off);
-    Payload (Unsized ropes)
-  | 0, true ->
-    Payload (Unfragmented slice)
+    Unsized ropes
+  | 0, true -> invalid_arg "Unfragmented packet"
   | _, true ->
     let str = Slice_bstr.to_string slice in
     let empty = Ropes.(Unknown Limitless) in
     let ropes = Ropes.insert ~off str empty in
     let max = off + String.length str in
     Log.debug (fun m -> m "+%d byte(s) %@ %d (max: %d)" (String.length str) off max);
-    let ropes = Ropes.fix ~max ropes in
+    let ropes = Ropes.fixed ~max ropes in
     let diet, buf = Ropes.to_bytes ropes in
-    Payload (Sized (diet, buf))
+    Sized (diet, buf)
+
+let weight = function
+  | Unsized ropes -> Ropes.weight ropes
+  | Sized (_, buf) -> Bytes.length buf
 
 exception Out_of_bounds
 exception Overlap
+exception Too_big
 
 let () = Printexc.register_printer @@ function
   | Out_of_bounds -> Some "Fragment out of bounds"
   | Overlap -> Some "Fragment overlap"
+  | Too_big -> Some "Too big"
   | _ -> None
 
-let insert (t : fragmented payload) ~off ?(limit= false) str =
+let insert t ~off ?(limit= false) str =
   match t, limit with
   | Sized (diet, buf), false ->
       let len = String.length str in
@@ -106,17 +100,16 @@ let insert (t : fragmented payload) ~off ?(limit= false) str =
       let max = off + String.length str in
       Log.debug (fun m -> m "+%d byte(s) %@ %d (max: %d)" (String.length str) off max);
       let ropes = Ropes.insert ~off str ropes in
-      let ropes = Ropes.fix ~max ropes in
+      let ropes = Ropes.fixed ~max ropes in
       let diet, buf = Ropes.to_bytes ropes in
       Sized (diet, buf)
 
-let is_complete : type a. a payload -> bool = function
+let is_complete : t -> bool = function
   | Unsized _ -> false
   | Sized (diet, buf) ->
       let buf = Diet.add ~off:0 ~len:(Bytes.length buf) Diet.empty in
       Diet.(is_empty (diff diet buf))
-  | Unfragmented _ -> true
 
-let reassemble_exn : fragmented payload -> string = function
+let reassemble_exn = function
   | Unsized _ -> invalid_arg "Fragment.reassemble_exn"
   | Sized (_, buf) -> Bytes.unsafe_to_string buf

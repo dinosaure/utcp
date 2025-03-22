@@ -3,8 +3,6 @@ let src = Logs.Src.create "ipv4-miou-solo5"
 module Log = (val Logs.src_log src : Logs.LOG)
 module SBstr = Slice_bstr
 
-let error_msgf fmt = Fmt.kstr (fun msg -> Error (`Msg msg)) fmt
-
 module Flag = struct
   type t = DF | MF
 
@@ -38,21 +36,9 @@ module Packet = struct
     ; flags : Flag.t list
     ; off : int
     ; ttl : int
-    ; protocol : protocol
+    ; protocol : int
     ; checksum_and_length : 'a
     ; opt : Slice_bstr.t }
-  and protocol = ICMP | TCP | UDP
-
-  let protocol_of_int = function
-    | 1 -> Ok ICMP
-    | 6 -> Ok TCP
-    | 17 -> Ok UDP
-    | n -> error_msgf "Invalid IPv4 protocol (%02x)" n
-
-  let protocol_to_int = function
-    | ICMP -> 1
-    | TCP -> 6
-    | UDP -> 17
 
   let pp_error ppf = function
     | `Invalid_IPv4_packet -> Fmt.string ppf "bad packet"
@@ -148,7 +134,6 @@ module Packet = struct
     let off = flags_and_off land 0x1fff in
     let ttl = SBstr.get_uint8 slice 8 in
     let protocol = SBstr.get_uint8 slice 9 in
-    let* protocol = protocol_of_int protocol in
     let checksum = SBstr.get_uint16_be slice 10 in
     let chk =
       let { Slice.buf; off; _ } = slice in
@@ -178,29 +163,55 @@ module Packet = struct
     Bstr.set_uint16_be bstr (off + 4) t.uid;
     Bstr.set_uint16_be bstr (off + 6) (flags_and_off_to_int t);
     Bstr.set_uint8 bstr (off + 8) t.ttl;
-    Bstr.set_uint8 bstr (off + 9) (protocol_to_int t.protocol);
+    Bstr.set_uint8 bstr (off + 9) t.protocol;
     Bstr.set_uint16_be bstr (off + 10) 0;
     Bstr.set_int32_be bstr (off + 12) (Ipaddr.V4.to_int32 t.src);
     Bstr.set_int32_be bstr (off + 16) (Ipaddr.V4.to_int32 t.dst)
 end
+
+module Key = struct
+  type t =
+    { src : Ipaddr.V4.t
+    ; dst : Ipaddr.V4.t
+    ; protocol : int
+    ; uid : int }
+
+  let equal a b =
+    Ipaddr.V4.compare a.src b.src == 0
+    && Ipaddr.V4.compare a.dst b.dst == 0
+    && a.protocol == b.protocol
+    && a.uid == b.uid
+
+  let hash = Hashtbl.hash
+end
+
+module Value = struct
+  type t =
+    { to_expire : int
+    ; fragment : Fragment.t
+    ; count : int }
+
+  let weight { fragment; _ } = Fragment.weight fragment
+end
+
+module Cache = Lru.M.Make (Key) (Value)
 
 module Fragments = struct
   let src = Logs.Src.create "fragments"
   
   module Log = (val Logs.src_log src : Logs.LOG)
 
-  type elt = { mutable payload : Fragment.t; expire : int }
-
   type t =
-    { table : elt Table.t
+    { cache : Cache.t
     ; to_expire : int }
 
   let max_expiration = Int64.to_int (Duration.of_sec 10)
 
-  let create ?max ?(to_expire= max_expiration) () =
-    { table= Table.make ?max ()
+  let create ?(to_expire= max_expiration) () =
+    { cache= Cache.create (1024*256)
     ; to_expire }
 
+  (*
   let clear t =
     let now = Miou_solo5.clock_monotonic () in
     let fn node = match Table.value t.table node with
@@ -208,53 +219,67 @@ module Fragments = struct
         Table.remove t.table node
       | _ -> () in
     Table.iter ~fn t.table
-
-  let to_protocol = function
-    | Packet.ICMP -> Fragment.ICMP
-    | Packet.TCP -> Fragment.TCP
-    | Packet.UDP -> Fragment.UDP
+  *)
 
   let catch ~on_exn fn =
     try fn () with exn -> on_exn exn
-
-  let insert t pkt slice =
-    let src = pkt.Packet.src
-    and dst = pkt.Packet.dst
-    and protocol = to_protocol pkt.Packet.protocol
-    and uid = pkt.Packet.uid
-    and off = pkt.Packet.off * 8
-    and limit = not (List.exists ((==) Flag.MF) pkt.Packet.flags) in
-    let key = { Fragment.src; dst; protocol; uid } in
-    match Table.find t.table key with
-    | exception Not_found ->
-        clear t;
-        if Table.is_full t.table == false
-        then
-          let now = Miou_solo5.clock_monotonic () in
-          let payload = Fragment.singleton ~off ~limit slice in
-          Table.add t.table key { payload; expire= now + t.to_expire }
-        else Log.warn (fun m -> m "Cache is full, ignore IPv4 packet:%04x" uid)
-    | (node, elt) ->
-      match elt.payload with
-      | Fragment.Payload (Unfragmented _) ->
-          Table.remove t.table node
-      | Fragment.Payload (Sized _ as p) ->
-          let on_exn _exn = Table.remove t.table node in
-          catch ~on_exn @@ fun () ->
-          let str = SBstr.to_string slice in
-          let p = Fragment.insert p ~off ~limit str in
-          elt.payload <- Fragment.Payload p
-      | Fragment.Payload (Unsized _ as p) ->
-          let on_exn _exn = Table.remove t.table node in
-          catch ~on_exn @@ fun () ->
-          let str = SBstr.to_string slice in
-          let p = Fragment.insert p ~off ~limit str in
-          elt.payload <- Fragment.Payload p
 
   type payload =
     | Slice of SBstr.t
     | String of string
 
+  let insert t pkt slice =
+    let src = pkt.Packet.src
+    and dst = pkt.Packet.dst
+    and protocol = pkt.Packet.protocol
+    and uid = pkt.Packet.uid
+    and off = pkt.Packet.off * 8
+    and limit = not (List.exists ((==) Flag.MF) pkt.Packet.flags) in
+    let key = { Key.src; dst; protocol; uid } in
+    let now = Miou_solo5.clock_monotonic () in
+    match off, limit, Cache.find key t.cache with
+    | 0, true, None -> Some (key, Slice slice) (* unfragmented packed *)
+    | _, _, None ->
+        Log.debug (fun m -> m "new fragment %04x" uid);
+        let fragment = Fragment.singleton ~off ~limit slice in
+        let value = { Value.to_expire= now + t.to_expire; count= 1; fragment } in
+        Cache.add key value t.cache;
+        Cache.trim t.cache;
+        None
+    | _, _, Some { count; _ } when count > 16 ->
+        Cache.remove key t.cache;
+        None
+    | _, _, Some { to_expire; _ } when to_expire < now ->
+        let fragment = Fragment.singleton ~off ~limit slice in
+        let value = { Value.to_expire= now + t.to_expire; count= 1; fragment } in
+        Cache.add key value t.cache;
+        None
+    | _, _, Some { fragment; count; to_expire } ->
+        let on_exn _exn = Cache.remove key t.cache; None in
+      catch ~on_exn @@ fun () ->
+      let str = SBstr.to_string slice in
+      let fragment = Fragment.insert fragment ~off ~limit str in
+      if Fragment.is_complete fragment
+      then begin
+        Log.debug (fun m -> m "fragment is complete");
+        let str = Fragment.reassemble_exn fragment in
+        Cache.remove key t.cache;
+        Some (key, String str)
+      end else begin
+        let value = { Value.fragment; count= count + 1; to_expire } in
+        Cache.add key value t.cache;
+        Cache.trim t.cache;
+        None
+      end
+      (* | Fragment.Payload (Unsized _ as p) ->
+          let on_exn _exn = Cache.remove t.table key in
+          catch ~on_exn @@ fun () ->
+          let str = SBstr.to_string slice in
+          let fragment = Fragment.(Payload (insert p ~off ~limit str)) in
+          let value = { Value.fragment; count= count + 1; to_expire } in
+          Cache.add key value t.cache;
+          Cache.trim t.cache *)
+  (*
   let get t =
     let res = ref [] in
     let fn node =
@@ -281,18 +306,18 @@ module Fragments = struct
                 Table.remove t.table node
               end in
     Table.iter ~fn t.table; !res
+  *)
 end
 
 module Ethernet = Ethernet_miou_solo5
 module ARPv4 = Arp_miou_solo5
 
-type packet = Fragment.header =
+type packet = Key.t =
   { src : Ipaddr.V4.t
   ; dst : Ipaddr.V4.t
-  ; protocol : protocol
+  ; protocol : int
   ; uid : int }
 
-and protocol = Fragment.protocol = ICMP | TCP | UDP
 and payload = Fragments.payload =
   | Slice of SBstr.t
   | String of string
@@ -303,7 +328,7 @@ type t =
   ; cidr : Ipaddr.V4.Prefix.t
   ; gateway : Ipaddr.V4.t option
   ; cache : Fragments.t
-  ; mutable handler : (packet * payload) list -> unit
+  ; mutable handler : (packet * payload) -> unit
   ; src : Logs.src }
 
 module Writer = struct
@@ -430,10 +455,10 @@ end
 
 let guard err fn = if fn () then Ok () else Error err
 
-let create ?cache:max ?to_expire eth arp ?gateway ?(handler= ignore) cidr =
+let create ?to_expire eth arp ?gateway ?(handler= ignore) cidr =
   let src = Logs.Src.create (Ipaddr.V4.Prefix.to_string cidr) in
   let t = { eth; arp; cidr; gateway
-          ; cache= Fragments.create ?max ?to_expire ()
+          ; cache= Fragments.create ?to_expire ()
           ; handler
           ; src } in
   let ( let* ) = Result.bind in
@@ -455,11 +480,7 @@ let fixed pkt user's_fn len bstr =
   Bstr.set_uint16_be bstr 10 chk;
   20 + len
 
-let write t ?(ttl= 38) ?src dst protocol p =
-  let protocol = match protocol with
-    | ICMP -> Packet.ICMP
-    | TCP -> Packet.TCP
-    | UDP -> Packet.UDP in
+let write t ?(ttl= 38) ?src dst ~protocol p =
   Logs.debug ~src:t.src (fun m -> m "Asking where is %a" Ipaddr.V4.pp dst);
   match Routing.destination_macaddr t.cidr t.gateway t.arp dst with
   | Error (`Exn _ | `Timeout | `Clear) ->
@@ -543,9 +564,8 @@ let input t pkt =
       then begin
         Logs.debug ~src:t.src (fun m -> m "Incoming IPv4 packet from %a"
           Ipaddr.V4.pp ipv4.Packet.src);
-        Fragments.insert t.cache ipv4 payload;
-        let pkts = Fragments.get t.cache in
-        t.handler pkts 
+        let pkt = Fragments.insert t.cache ipv4 payload in
+        Option.iter t.handler pkt
       end
 
 let _cnt = Atomic.make 0

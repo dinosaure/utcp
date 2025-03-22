@@ -6,21 +6,19 @@ type t
 type packet =
   { src : Ipaddr.V4.t
   ; dst : Ipaddr.V4.t
-  ; protocol : protocol
+  ; protocol : int
   ; uid : int }
 
-and protocol = ICMP | TCP | UDP
 and payload =
   | Slice of Slice_bstr.t
   | String of string
 
 val create :
-     ?cache:int
-  -> ?to_expire:int
+     ?to_expire:int
   -> Ethernet.t
   -> ARPv4.t
   -> ?gateway:Ipaddr.V4.t
-  -> ?handler:((packet * payload) list -> unit)
+  -> ?handler:((packet * payload) -> unit)
   -> Ipaddr.V4.Prefix.t
   -> (t, [> `MTU_too_small ]) result
 
@@ -50,7 +48,7 @@ val write :
   -> ?ttl:int
   -> ?src:Ipaddr.V4.t
   -> Ipaddr.V4.t
-  -> protocol
+  -> protocol:int
   -> Writer.t
   -> (unit, [> `Route_not_found ]) result
 (** [write ?ttl ?src dst protocol ?finally ?size sstr] writes a new IPv4
@@ -63,4 +61,4 @@ val write :
     advance via the [size] argument. *)
 
 val input : t -> Slice_bstr.t Ethernet.packet -> unit
-val set_handler : t -> ((packet * payload) list -> unit) -> unit
+val set_handler : t -> ((packet * payload) -> unit) -> unit

@@ -143,7 +143,7 @@ let input ipv4 pkt payload =
           Bytes.set_uint16_be buf 2 chk;
           let pkt = Bytes.unsafe_to_string buf in
           let pkt = IPv4.Writer.of_strings ipv4 [ pkt; payload ] in
-          let result = IPv4.write ipv4 dst IPv4.ICMP pkt in
+          let result = IPv4.write ipv4 dst ~protocol:1 pkt in
           let err _ =
             Log.err (fun m -> m "Impossible to send ICMPv4 echo-reply packet") in
           let _ = Result.map_error err result in ()

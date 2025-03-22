@@ -2,4 +2,4 @@
  (name utcp_miou_solo5)
  (public_name utcp-miou-solo5)
  (flags (:standard -dlambda -dump-into-file))
- (libraries mirage-crypto-rng utcp duration hxd.core hxd.string fmt ipaddr macaddr bin slice.bstr miou-solo5))
+ (libraries lru mirage-crypto-rng utcp duration hxd.core hxd.string fmt ipaddr macaddr bin slice.bstr miou-solo5))
