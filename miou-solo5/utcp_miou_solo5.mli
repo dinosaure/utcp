@@ -28,3 +28,8 @@ module TCPv4 : sig
   val listen : state -> int -> listen
   val accept : state -> listen -> flow
 end
+
+type tcpv4
+
+val tcpv4 : name:string -> ?gateway:Ipaddr.V4.t -> Ipaddr.V4.Prefix.t -> (tcpv4  * TCPv4.state) Miou_solo5.arg
+val kill : tcpv4 -> unit

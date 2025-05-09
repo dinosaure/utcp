@@ -409,3 +409,87 @@ module TCPv4 = struct
         Logs.err ~src (fun m -> m "%a error established connection: %s" Utcp.pp_flow flow msg);
         raise Connection_refused
 end
+
+let pp_error ppf = function
+  | `MTU_too_small -> Fmt.string ppf "MTU too small"
+  | `Exn exn -> Fmt.pf ppf "exception: %s" (Printexc.to_string exn)
+
+let ethernet_handler arpv4 ipv4 = ();
+  (* NOTE(dinosaure): about the handler and the packet received. The latter is
+     in the form of a [Bstr.t] that physically corresponds to the [Bstr.t] used
+     by Solo5. So to speak, from Solo5 to this [handler], there is no copy
+     and the [Bstr.t] given is exclusive to the current task. However, as soon
+     as this task is finished or would like to interact with the scheduler (and
+     produce an effect), the guarantee of exclusivity is no longer assured.
+
+     Depending on what you want to do, it may or may not be necessary to make a
+     copy of this [Bstr.t].
+
+     Currently, we can recognize a "happy-path" focus on TCP/IP. That is to say
+     that upon receipt of a TCP/IP packet, we would like to go as far as
+     possible without interruptions (like [Miou.yield] or any effects) to the
+     TCP layer. In this case, the IPv4 handler has no effect, it just tries to
+     reassemble packets it can depending on whether they are fragmented or not.
+     In short, the happy path corresponds to the moment when IPv4 returns a
+     packet in the form of a [Bstr.t] — that is to say that we have just
+     obtained a non-fragmented and complete packet and this packet still
+     physically corresponds to the one written by Solo5. Otherwise, [IPv4]
+     returns a packet in the form of a [string] which means that it has been
+     fragmented.
+
+     This choice to return 2 types of payloads corresponds to a simple split: it
+     is expensive to copy a [Bstr.t]. If we were to copy the [Bstr.t] given by
+     [Ethernet], it is always more worthwhile to finally transform it into a
+     [string] rather than "pretending that we still have a [Bstr.t]" underneath.
+     This distinction also clarifies another point: ownership. If you are
+     manipulating a [Bstr.t], you have to pay close attention to ownership and
+     always consider this "happy path" (without interruptions). Otherwise, you
+     can just manipulate the strings without asking yourself this question. *)
+  let handler pkt =
+    match pkt.Ethernet.protocol with
+    | Ethernet.ARPv4 -> ARPv4.transfer arpv4 pkt
+    | Ethernet.IPv4 -> IPv4.input ipv4 pkt
+    | _ -> () in
+  handler
+
+let ipv4_handler icmpv4 tcpv4 = (); fun ((hdr, _) as pkt)->
+  match hdr.IPv4.protocol with
+  | 1 -> ICMPv4.transfer icmpv4 pkt
+  | 6 -> TCPv4.handler tcpv4 pkt
+  | _ -> ()
+
+type tcpv4 =
+  { ethernet_daemon : Ethernet.daemon
+  ; arpv4_daemon : ARPv4.daemon
+  ; icmpv4 : ICMPv4.daemon
+  ; tcpv4_daemon : TCPv4.daemon }
+
+let kill t =
+  TCPv4.kill t.tcpv4_daemon;
+  ICMPv4.kill t.icmpv4;
+  ARPv4.kill t.arpv4_daemon;
+  Ethernet.kill t.ethernet_daemon
+
+let tcpv4 ~name ?gateway cidr =
+  let fn (net, cfg) () =
+    let connect mac =
+      let ( let* ) = Result.bind in
+      let* daemon, eth = Ethernet.create ~mtu:cfg.Miou_solo5.Net.mtu mac net in
+      Logs.debug (fun m -> m "✓ ethernet plugged (%a)" Macaddr.pp (Ethernet.mac eth));
+      let* arpv4_daemon, arpv4 = ARPv4.create ~ipaddr:(Ipaddr.V4.Prefix.address cidr) eth in
+      Logs.debug (fun m -> m "✓ ARPv4 daemon launched");
+      let* ipv4 = IPv4.create eth arpv4 ?gateway cidr in
+      Logs.debug (fun m -> m "✓ IPv4 stack created");
+      let icmpv4 = ICMPv4.handler ipv4 in
+      Logs.debug (fun m -> m "✓ ICMPv4 daemon launched");
+      let tcpv4_daemon, tcpv4 = TCPv4.create ~name:"uniker.ml" ipv4 in
+      Logs.debug (fun m -> m "✓ TCPv4 daemon launched");
+      IPv4.set_handler ipv4 (ipv4_handler icmpv4 tcpv4);
+      let fn = ethernet_handler arpv4 ipv4 in
+      Ethernet.set_handler eth fn;
+      Ok ({ ethernet_daemon= daemon; arpv4_daemon; icmpv4; tcpv4_daemon }, tcpv4) in
+    let mac = Macaddr.of_octets_exn (cfg.Miou_solo5.Net.mac :> string) in
+    match connect mac with
+    | Ok daemon -> daemon
+    | Error err -> Fmt.failwith "%a" pp_error err in
+  Miou_solo5.(map fn [ net name ])
